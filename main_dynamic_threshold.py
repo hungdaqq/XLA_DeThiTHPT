@@ -41,14 +41,18 @@ def order_points(pts: np.ndarray) -> np.ndarray:
 
 
 def find_corner_markers(image: np.ndarray,
-                        debug_out: str = None) -> np.ndarray:
+                        debug_out: str = None) -> Tuple[np.ndarray, bool]:
     """Tìm 4 góc của tờ phiếu (đánh dấu gốc) bằng phương pháp adaptive threshold.
     
     Chiến lược: Tìm các contour hình tròn/vuông ở 4 góc => sắp xếp lại vị trí
+    
+    Returns:
+        Tuple[corners, is_valid]: corners và flag cho biết có tìm được đủ marker không
     """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     H, W = gray.shape
     corners = None
+    is_valid = False
 
     # Chiến lược A: adaptive threshold + kiểm tra contour rắn chắc
     binary = cv2.adaptiveThreshold(
@@ -73,6 +77,16 @@ def find_corner_markers(image: np.ndarray,
         if fill > 0.55:
             cands.append((x + bw / 2, y + bh / 2, area))
     
+    # Validation: Check if enough marker candidates detected
+    if len(cands) < 20:
+        print(f"[⚠️  INVALID SHEET] Phát hiện quá ít marker ({len(cands)} < 20) - Đây không phải là một phiếu trả lời hợp lệ!")
+        # Return default corners (no marker detection possible)
+        pad = 6
+        corners = np.array([[pad,pad],[W-pad,pad],[W-pad,H-pad],[pad,H-pad]], dtype="float32")
+        return order_points(corners), False
+    
+    is_valid = True
+    
     # Pick 4 corners
     if len(cands) >= 4:
         pts = np.array([(c[0], c[1]) for c in cands], dtype="float32")
@@ -92,6 +106,7 @@ def find_corner_markers(image: np.ndarray,
     if corners is None:
         pad = 6
         corners = np.array([[pad,pad],[W-pad,pad],[W-pad,H-pad],[pad,H-pad]], dtype="float32")
+        is_valid = False
 
     corners = order_points(corners)
     if debug_out:
@@ -104,7 +119,7 @@ def find_corner_markers(image: np.ndarray,
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
         cv2.polylines(dbg, [corners.astype(int).reshape(-1,1,2)], True, (0,255,0), 3)
         cv2.imwrite(debug_out, dbg)
-    return corners
+    return corners, is_valid
 
 
 def warp(image: np.ndarray, corners: np.ndarray,
@@ -1004,7 +1019,12 @@ def process(image_path: str, out_dir: str = "./outputs_grid", debug: bool = True
         raise FileNotFoundError(image_path)
     
     # Bước 1: Tìm 4 góc của tờ
-    corners = find_corner_markers(image, debug_out=f"{out_dir}/01_corners.jpg" if debug else None)
+    corners, corners_valid = find_corner_markers(image, debug_out=f"{out_dir}/01_corners.jpg" if debug else None)
+    
+    # Kiểm tra xem có tìm được đủ marker không
+    if not corners_valid:
+        print("\n[ERROR] Không tìm thấy đủ điểm góc - Hủy xử lý")
+        return
     
     # Bước 2: Chỉnh thẳng tờ
     warped = warp(image, corners)
