@@ -631,6 +631,439 @@ def detect_grid_points(
     return debug_data
 
 
+def _cell_quad_from_grid(
+    region_quad: np.ndarray,
+    row: int,
+    col: int,
+    grid_rows: int,
+    grid_cols: int,
+) -> np.ndarray:
+    """Build one cell quad from grid row/col inside a region quad."""
+    v0 = row / float(grid_rows)
+    v1 = (row + 1) / float(grid_rows)
+    u0 = col / float(grid_cols)
+    u1 = (col + 1) / float(grid_cols)
+
+    return np.array(
+        [
+            _point_on_quad(region_quad, u0, v0),
+            _point_on_quad(region_quad, u1, v0),
+            _point_on_quad(region_quad, u1, v1),
+            _point_on_quad(region_quad, u0, v1),
+        ],
+        dtype=np.float32,
+    )
+
+
+def _analyze_polygon_fill_ratio(
+    binary_image: np.ndarray,
+    polygon: np.ndarray,
+    fill_ratio_thresh: float,
+    roi_inset_ratio: float = 0.10,
+) -> Dict[str, object]:
+    """Measure white-pixel ratio in a polygon on binary image and classify filled/empty."""
+    poly = polygon.reshape(-1, 2).astype(np.float32)
+    poly_i = np.round(poly).astype(np.int32)
+
+    # Inset ROI by ratio from each edge to reduce border-line contamination.
+    inset = float(np.clip(roi_inset_ratio, 0.0, 0.45))
+    if inset > 0.0:
+        m = cv2.moments(poly_i)
+        if abs(m["m00"]) > 1e-6:
+            cx = float(m["m10"] / m["m00"])
+            cy = float(m["m01"] / m["m00"])
+        else:
+            cx = float(np.mean(poly[:, 0]))
+            cy = float(np.mean(poly[:, 1]))
+
+        scale = max(0.05, 1.0 - (2.0 * inset))
+        roi_poly = np.empty_like(poly)
+        roi_poly[:, 0] = cx + (poly[:, 0] - cx) * scale
+        roi_poly[:, 1] = cy + (poly[:, 1] - cy) * scale
+    else:
+        roi_poly = poly.copy()
+
+    roi_poly_i = np.round(roi_poly).astype(np.int32)
+
+    h_img, w_img = binary_image.shape[:2]
+    x, y, w, h = cv2.boundingRect(roi_poly_i)
+    x0 = max(0, x)
+    y0 = max(0, y)
+    x1 = min(w_img, x + w)
+    y1 = min(h_img, y + h)
+
+    if x1 <= x0 or y1 <= y0:
+        return {
+            "fill_ratio": 0.0,
+            "is_filled": False,
+            "polygon": poly_i,
+            "roi_polygon": roi_poly_i,
+            "box_bounds": (x0, y0, x1, y1),
+        }
+
+    roi = binary_image[y0:y1, x0:x1]
+    local_poly = roi_poly_i.copy()
+    local_poly[:, 0] -= x0
+    local_poly[:, 1] -= y0
+
+    mask = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
+    cv2.fillPoly(mask, [local_poly], 255)
+
+    valid = mask > 0
+    valid_count = int(np.count_nonzero(valid))
+    if valid_count <= 0:
+        return {
+            "fill_ratio": 0.0,
+            "is_filled": False,
+            "polygon": poly_i,
+            "roi_polygon": roi_poly_i,
+            "box_bounds": (x0, y0, x1, y1),
+        }
+
+    white_count = int(np.count_nonzero((roi > 0) & valid))
+    fill_ratio = float(white_count) / float(valid_count)
+    is_filled = fill_ratio > float(fill_ratio_thresh)
+
+    return {
+        "fill_ratio": fill_ratio,
+        "is_filled": is_filled,
+        "polygon": poly_i,
+        "roi_polygon": roi_poly_i,
+        "box_bounds": (x0, y0, x1, y1),
+    }
+
+
+def _analyze_polygon_mean_darkness(
+    gray_image: np.ndarray,
+    polygon: np.ndarray,
+    roi_inset_ratio: float = 0.20,
+) -> Dict[str, object]:
+    """Measure mean darkness in an inset polygon on grayscale image."""
+    poly = polygon.reshape(-1, 2).astype(np.float32)
+    poly_i = np.round(poly).astype(np.int32)
+
+    inset = float(np.clip(roi_inset_ratio, 0.0, 0.45))
+    if inset > 0.0:
+        m = cv2.moments(poly_i)
+        if abs(m["m00"]) > 1e-6:
+            cx = float(m["m10"] / m["m00"])
+            cy = float(m["m01"] / m["m00"])
+        else:
+            cx = float(np.mean(poly[:, 0]))
+            cy = float(np.mean(poly[:, 1]))
+
+        scale = max(0.05, 1.0 - (2.0 * inset))
+        roi_poly = np.empty_like(poly)
+        roi_poly[:, 0] = cx + (poly[:, 0] - cx) * scale
+        roi_poly[:, 1] = cy + (poly[:, 1] - cy) * scale
+    else:
+        roi_poly = poly.copy()
+
+    roi_poly_i = np.round(roi_poly).astype(np.int32)
+
+    h_img, w_img = gray_image.shape[:2]
+    x, y, w, h = cv2.boundingRect(roi_poly_i)
+    x0 = max(0, x)
+    y0 = max(0, y)
+    x1 = min(w_img, x + w)
+    y1 = min(h_img, y + h)
+
+    if x1 <= x0 or y1 <= y0:
+        return {
+            "mean_darkness": 255.0,
+            "polygon": poly_i,
+            "roi_polygon": roi_poly_i,
+            "box_bounds": (x0, y0, x1, y1),
+        }
+
+    roi = gray_image[y0:y1, x0:x1]
+    local_poly = roi_poly_i.copy()
+    local_poly[:, 0] -= x0
+    local_poly[:, 1] -= y0
+
+    mask = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
+    cv2.fillPoly(mask, [local_poly], 255)
+
+    valid = mask > 0
+    valid_count = int(np.count_nonzero(valid))
+    if valid_count <= 0:
+        return {
+            "mean_darkness": 255.0,
+            "polygon": poly_i,
+            "roi_polygon": roi_poly_i,
+            "box_bounds": (x0, y0, x1, y1),
+        }
+
+    mean_darkness = float(np.mean(roi[valid]))
+    return {
+        "mean_darkness": mean_darkness,
+        "polygon": poly_i,
+        "roi_polygon": roi_poly_i,
+        "box_bounds": (x0, y0, x1, y1),
+    }
+
+
+def evaluate_grid_cells_with_horizontal_binary(
+    original_image: np.ndarray,
+    horizontal_binary: np.ndarray,
+    part_i_grid_info: Optional[List[Dict[str, object]]] = None,
+    part_ii_grid_info: Optional[List[Dict[str, object]]] = None,
+    part_iii_grid_info: Optional[List[Dict[str, object]]] = None,
+    sobao_danh_rows: Optional[List[List[np.ndarray]]] = None,
+    ma_de_rows: Optional[List[List[np.ndarray]]] = None,
+    debug_prefix: Optional[str] = None,
+) -> Dict[str, object]:
+    """Classify filled/empty cells by matching grid polygons to horizontal-line binary image."""
+    result_image = original_image.copy()
+    fill_overlay = original_image.copy()
+    gray_image = cv2.cvtColor(original_image, cv2.COLOR_BGR2GRAY) if original_image.ndim == 3 else original_image.copy()
+
+    green = (0, 255, 0)
+    empty_color = (0, 165, 255)
+
+    all_items: List[Dict[str, object]] = []
+    draw_items: List[Dict[str, object]] = []
+
+    section_thresholds = {
+        "part_i": 0.095,
+        "part_ii": 0.095,
+        "part_iii": 0.095,
+    }
+
+    section_darkness_upper = {
+        "sobaodanh": 85.0,
+        "made": 85.0,
+    }
+
+    def _add_grid_section(
+        section_name: str,
+        infos: Optional[List[Dict[str, object]]],
+    ) -> None:
+        if not infos:
+            return
+
+        thresh = section_thresholds[section_name]
+        for info in infos:
+            region_quad = np.array(info["region_quad"], dtype=np.float32)
+            grid_rows, grid_cols = info["grid_shape"]
+            pattern = info.get("pattern")
+            box_idx = int(info["box_idx"])
+
+            for row in range(int(grid_rows)):
+                if pattern and row < len(pattern):
+                    cols = pattern[row]
+                else:
+                    cols = range(int(grid_cols))
+
+                for col in cols:
+                    if col < 0 or col >= int(grid_cols):
+                        continue
+
+                    cell_poly = _cell_quad_from_grid(region_quad, row, int(col), int(grid_rows), int(grid_cols))
+                    metric = _analyze_polygon_fill_ratio(horizontal_binary, cell_poly, thresh)
+
+                    all_items.append(
+                        {
+                            "section": section_name,
+                            "box_idx": box_idx,
+                            "row": row,
+                            "col": int(col),
+                            "filled": metric["is_filled"],
+                            "fill_ratio": metric["fill_ratio"],
+                            "box_bounds": metric["box_bounds"],
+                            "polygon": metric["polygon"],
+                            "metric_name": "fill_ratio",
+                            "metric_value": metric["fill_ratio"],
+                        }
+                    )
+                    draw_items.append(
+                        {
+                            "polygon": metric["polygon"],
+                            "filled": bool(metric["is_filled"]),
+                            "metric_name": "fill_ratio",
+                            "metric_value": float(metric["fill_ratio"]),
+                        }
+                    )
+
+    def _row_center_y(row: List[np.ndarray]) -> float:
+        centers: List[float] = []
+        for poly in row:
+            x, y, w, h = cv2.boundingRect(poly)
+            centers.append(y + (h / 2.0))
+        return float(np.mean(centers)) if centers else 0.0
+
+    def _add_id_rows_with_mean_darkness(
+        section_name: str,
+        rows: Optional[List[List[np.ndarray]]],
+    ) -> None:
+        if not rows:
+            return
+
+        sorted_rows = sorted(rows, key=_row_center_y)
+        normalized_rows: List[List[np.ndarray]] = []
+        for row in sorted_rows:
+            row_sorted = sorted(row, key=lambda p: cv2.boundingRect(p)[0])
+            if row_sorted:
+                normalized_rows.append(row_sorted)
+
+        if not normalized_rows:
+            return
+
+        max_cols = max(len(row) for row in normalized_rows)
+        darkness_upper = section_darkness_upper.get(section_name, 85.0)
+
+        for col_idx in range(max_cols):
+            col_items: List[Tuple[int, Dict[str, object]]] = []
+            for row_idx, row in enumerate(normalized_rows):
+                if col_idx >= len(row):
+                    continue
+                metric = _analyze_polygon_mean_darkness(gray_image, row[col_idx].reshape(-1, 2))
+                col_items.append((row_idx, metric))
+
+            if not col_items:
+                continue
+
+            best_row_idx, best_metric = min(col_items, key=lambda item: float(item[1]["mean_darkness"]))
+
+            # Keep behavior aligned with main_dynamic_threshold: choose darkest box per column.
+            best_darkness = float(best_metric["mean_darkness"])
+            use_winner = True
+
+            for row_idx, metric in col_items:
+                is_filled = bool(use_winner and row_idx == best_row_idx)
+                metric_darkness = float(metric["mean_darkness"])
+
+                all_items.append(
+                    {
+                        "section": section_name,
+                        "box_idx": row_idx,
+                        "row": row_idx,
+                        "col": col_idx,
+                        "filled": is_filled,
+                        "fill_ratio": 0.0,
+                        "mean_darkness": metric_darkness,
+                        "darkness_threshold": darkness_upper,
+                        "best_darkness_in_col": best_darkness,
+                        "box_bounds": metric["box_bounds"],
+                        "polygon": metric["polygon"],
+                        "metric_name": "mean_darkness",
+                        "metric_value": metric_darkness,
+                    }
+                )
+                draw_items.append(
+                    {
+                        "polygon": metric["polygon"],
+                        "filled": is_filled,
+                        "metric_name": "mean_darkness",
+                        "metric_value": metric_darkness,
+                    }
+                )
+
+    def _add_box_rows(
+        section_name: str,
+        rows: Optional[List[List[np.ndarray]]],
+    ) -> None:
+        if not rows:
+            return
+
+        if section_name in {"sobaodanh", "made"}:
+            _add_id_rows_with_mean_darkness(section_name, rows)
+            return
+
+        thresh = section_thresholds[section_name]
+        for row_idx, row in enumerate(rows):
+            for col_idx, poly in enumerate(row):
+                metric = _analyze_polygon_fill_ratio(horizontal_binary, poly.reshape(-1, 2), thresh)
+                all_items.append(
+                    {
+                        "section": section_name,
+                        "box_idx": row_idx,
+                        "row": row_idx,
+                        "col": col_idx,
+                        "filled": metric["is_filled"],
+                        "fill_ratio": metric["fill_ratio"],
+                        "box_bounds": metric["box_bounds"],
+                        "polygon": metric["polygon"],
+                        "metric_name": "fill_ratio",
+                        "metric_value": metric["fill_ratio"],
+                    }
+                )
+                draw_items.append(
+                    {
+                        "polygon": metric["polygon"],
+                        "filled": bool(metric["is_filled"]),
+                        "metric_name": "fill_ratio",
+                        "metric_value": float(metric["fill_ratio"]),
+                    }
+                )
+
+    _add_grid_section("part_i", part_i_grid_info)
+    _add_grid_section("part_ii", part_ii_grid_info)
+    _add_grid_section("part_iii", part_iii_grid_info)
+    _add_box_rows("sobaodanh", sobao_danh_rows)
+    _add_box_rows("made", ma_de_rows)
+
+    for draw in draw_items:
+        poly = np.array(draw["polygon"], dtype=np.int32)
+        is_filled = bool(draw["filled"])
+        if is_filled:
+            cv2.fillPoly(fill_overlay, [poly], green)
+
+    result_image = cv2.addWeighted(fill_overlay, 0.5, result_image, 0.5, 0)
+
+    for draw in draw_items:
+        poly = np.array(draw["polygon"], dtype=np.int32)
+        is_filled = bool(draw["filled"])
+        color = green if is_filled else empty_color
+        thickness = 2 if is_filled else 1
+        cv2.polylines(result_image, [poly], True, color, thickness)
+
+    section_summary: Dict[str, Dict[str, int]] = {}
+    for item in all_items:
+        sec = str(item["section"])
+        if sec not in section_summary:
+            section_summary[sec] = {"total": 0, "filled": 0}
+        section_summary[sec]["total"] += 1
+        if bool(item["filled"]):
+            section_summary[sec]["filled"] += 1
+
+    if debug_prefix:
+        # Binary debug with per-cell fill ratio annotations.
+        ratio_debug = cv2.cvtColor(horizontal_binary, cv2.COLOR_GRAY2BGR)
+        for draw in draw_items:
+            poly = np.array(draw["polygon"], dtype=np.int32)
+            is_filled = bool(draw["filled"])
+            metric_name = str(draw.get("metric_name", "fill_ratio"))
+            metric_value = float(draw.get("metric_value", 0.0))
+
+            border_color = (0, 255, 0) if is_filled else (0, 200, 255)
+            cv2.polylines(ratio_debug, [poly], True, border_color, 1)
+
+            m = cv2.moments(poly)
+            if abs(m["m00"]) > 1e-6:
+                cx = int(m["m10"] / m["m00"])
+                cy = int(m["m01"] / m["m00"])
+            else:
+                x, y, w, h = cv2.boundingRect(poly)
+                cx = x + (w // 2)
+                cy = y + (h // 2)
+
+            label = f"{metric_value:.2f}" if metric_name == "fill_ratio" else f"D{metric_value:.0f}"
+            text_org = (max(0, cx - 10), max(10, cy + 4))
+            cv2.putText(ratio_debug, label, text_org, cv2.FONT_HERSHEY_SIMPLEX, 0.26, (0, 0, 0), 2)
+            cv2.putText(ratio_debug, label, text_org, cv2.FONT_HERSHEY_SIMPLEX, 0.26, (255, 255, 255), 1)
+
+        cv2.imwrite(f"{debug_prefix}_horizontal_binary.jpg", horizontal_binary)
+        cv2.imwrite(f"{debug_prefix}_horizontal_fill_ratio_debug.jpg", ratio_debug)
+        cv2.imwrite(f"{debug_prefix}_grid_filled_from_horizontal.jpg", result_image)
+
+    return {
+        "items": all_items,
+        "summary": section_summary,
+        "visualization": result_image,
+    }
+
+
 def detect_boxes_in_region(
     region: np.ndarray,
     min_box_area: int = 50,
@@ -2189,6 +2622,9 @@ def _demo(image_arg: Optional[str] = None) -> None:
         tried = ", ".join(str(p) for p in candidate_paths)
         raise FileNotFoundError(f"Cannot read image. Tried: {tried}")
 
+    # Keep a pristine image for horizontal-binary fill visualization.
+    original_image = img.copy()
+
     def _run_detection_pipeline(src_img: np.ndarray, prefix: Optional[str]) -> Tuple[Dict[str, object], Dict[str, object]]:
         data_local = detect_boxes_from_morph_lines(
             src_img,
@@ -2455,10 +2891,15 @@ def _demo(image_arg: Optional[str] = None) -> None:
     
     cv2.imwrite(f"{debug_prefix}_parts.jpg", overlay)
     print(f"Parts visualization saved to {debug_prefix}_parts.jpg")
+
+    cv2.imwrite(f"{debug_prefix}_original_copy.jpg", original_image)
     
     # Draw all parts grids on a single image
     print(f"\n=== Drawing grids on all parts ===")
     combined_grid_image = img.copy()
+    part_i_grid_info: List[Dict[str, object]] = []
+    part_ii_grid_info: List[Dict[str, object]] = []
+    part_iii_grid_info: List[Dict[str, object]] = []
     
     # Draw 4x10 grid on Part I boxes
     if parts["part_i"]:
@@ -2470,12 +2911,13 @@ def _demo(image_arg: Optional[str] = None) -> None:
             grid_rows=10,
             start_offset_ratio_x=0.2,
             start_offset_ratio_y=0.1,
-            end_offset_ratio_x=0.015,
-            end_offset_ratio_y=0.015,
+            end_offset_ratio_x=0.0,
+            end_offset_ratio_y=0.0,
             grid_color=(0, 255, 0),  # Green
             grid_thickness=1,
         )
         combined_grid_image = grid_result["image_with_grid"]
+        part_i_grid_info = grid_result["grid_info"]
         
         print(f"Grid drawn on {len(grid_result['grid_info'])} boxes")
         for info in grid_result["grid_info"]:
@@ -2512,6 +2954,7 @@ def _demo(image_arg: Optional[str] = None) -> None:
             grid_thickness=1,
         )
         combined_grid_image = grid_result_ii["image_with_grid"]
+        part_ii_grid_info = grid_result_ii["grid_info"]
         
         print(f"Grid drawn on {len(grid_result_ii['grid_info'])} boxes")
         for info in grid_result_ii["grid_info"]:
@@ -2540,13 +2983,14 @@ def _demo(image_arg: Optional[str] = None) -> None:
             grid_rows=12,
             start_offset_ratio_x=0.22,
             start_offset_ratio_y=0.16,
-            end_offset_ratio_x=0.1,
+            end_offset_ratio_x=0.05,
             end_offset_ratio_y=0.015,
             grid_color=(255, 0, 0),  # Blue (BGR format, so red in display)
             grid_thickness=1,
             row_col_patterns=custom_pattern,
         )
         combined_grid_image = grid_result_iii["image_with_grid"]
+        part_iii_grid_info = grid_result_iii["grid_info"]
         
         print(f"Grid drawn on {len(grid_result_iii['grid_info'])} boxes")
         for info in grid_result_iii["grid_info"]:
@@ -2577,6 +3021,39 @@ def _demo(image_arg: Optional[str] = None) -> None:
     combined_grid_path = f"{debug_prefix}_all_parts_with_grid.jpg"
     cv2.imwrite(combined_grid_path, combined_grid_image)
     print(f"\n✓ Combined grid image saved to: {combined_grid_path}")
+
+    # Use a separate raw morphology horizontal image for fill/empty classification
+    # so box detection logic remains unchanged.
+    raw_grid = detect_grid_points(
+        image=img,
+        vertical_scale=0.015,
+        horizontal_scale=0.015,
+        min_point_area=8,
+        block_size=35,
+        block_offset=7,
+        debug_prefix=None,
+    )
+    horizontal_binary = raw_grid["horizontal"]
+    fill_eval = evaluate_grid_cells_with_horizontal_binary(
+        original_image=original_image,
+        horizontal_binary=horizontal_binary,
+        part_i_grid_info=part_i_grid_info,
+        part_ii_grid_info=part_ii_grid_info,
+        part_iii_grid_info=part_iii_grid_info,
+        sobao_danh_rows=sobao_danh.get("sobao_danh_rows"),
+        ma_de_rows=ma_de.get("ma_de_rows"),
+        debug_prefix=debug_prefix,
+    )
+
+    print("\n=== Horizontal Binary Fill Summary ===")
+    for section in ["part_i", "part_ii", "part_iii", "sobaodanh", "made"]:
+        sec_summary = fill_eval["summary"].get(section)
+        if not sec_summary:
+            continue
+        print(f"  {section}: {sec_summary['filled']}/{sec_summary['total']} filled")
+    print(f"  Saved binary debug: {debug_prefix}_horizontal_binary.jpg")
+    print(f"  Saved ratio debug: {debug_prefix}_horizontal_fill_ratio_debug.jpg")
+    print(f"  Saved fill debug: {debug_prefix}_grid_filled_from_horizontal.jpg")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Detect and draw answer grids from form images.")
