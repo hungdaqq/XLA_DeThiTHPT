@@ -1,5 +1,5 @@
 """
-Streamlit web application using the same detection/decoding logic as main.py.
+Streamlit web application using the same detection/decoding logic as datetime.py.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import cv2
 import numpy as np
 import streamlit as st
 
-import main as core
+import detect as core
 
 
 def _to_rgb(image: np.ndarray) -> np.ndarray:
@@ -126,7 +126,7 @@ def _process_image_with_main_logic(
         debug=False,
     )
 
-    # Keep the same MaDe completion behavior as main.py.
+    # Keep the same MaDe completion behavior as detect.py.
     if ma_de["row_count"] < 10 and ma_de["ma_de_rows"] and sobao_danh["sobao_danh_rows"]:
         ref_positions = []
         for row in sobao_danh["sobao_danh_rows"][:10]:
@@ -521,7 +521,7 @@ st.set_page_config(
 )
 
 st.title("📊 Nhận dạng phiếu trả lời THPT Quốc gia")
-st.markdown("Ứng dụng này chạy cùng pipeline nhận dạng/giải mã như main.py")
+st.markdown("Ứng dụng này chạy cùng pipeline nhận dạng/giải mã như detect.py")
 
 with st.sidebar:
     st.header("⚙️ Cấu Hình")
@@ -565,7 +565,7 @@ if uploaded_file is not None:
 
             debug_prefix = str(Path(temp_dir) / "grid") if debug_mode else None
 
-            status_text.text("Bước 2/3: Chạy pipeline main.py...")
+            status_text.text("Bước 2/3: Chạy pipeline detect.py...")
             progress_bar.progress(55)
             results = _process_image_with_main_logic(
                 image,
