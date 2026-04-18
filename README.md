@@ -1,12 +1,6 @@
-# Tài Liệu Kỹ Thuật detect.py
+# Tài Liệu Kỹ Thuật
 
-Tài liệu này mô tả chi tiết, theo đúng thứ tự thực thi, toàn bộ flow xử lý của file `detect.py`.
-Mục tiêu là để bạn có thể:
-
-- Hiểu chính xác pipeline đang làm gì ở từng bước.
-- Biết vì sao có các nhánh fallback trong code.
-- Dễ debug khi kết quả nhận dạng lệch.
-- Nắm rõ tham số nào ảnh hưởng mạnh đến độ chính xác.
+Tài liệu này mô tả chi tiết, theo đúng thứ tự thực thi, toàn bộ flow xử lý của file nhận diện câu trả lời trắc nghiệm `detect.py`.
 
 ## 1) Mục tiêu của pipeline
 
