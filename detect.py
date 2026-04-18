@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 import itertools
 
 import cv2
@@ -10,13 +10,33 @@ import numpy as np
 
 
 def _order_quad_points(points: np.ndarray) -> np.ndarray:
-    """Return 4 points ordered as top-left, top-right, bottom-right, bottom-left."""
+    # Hàm hỗ trợ một bước xử lý trong pipeline chấm phiếu.
+    """
+    Sắp xếp 4 đỉnh tứ giác theo thứ tự chuẩn: trên-trái, trên-phải, dưới-phải, dưới-trái.
+
+    Quy trình:
+    1. Chuẩn hóa mảng điểm về dạng (4, 2) float32.
+    2. Dùng tổng tọa độ `(x + y)` để tìm góc trên-trái và dưới-phải.
+    3. Dùng hiệu tọa độ `(x - y)` để tách hai góc còn lại.
+    4. Trả về mảng 4 điểm theo thứ tự cố định để các bước nội suy hoạt động ổn định.
+
+    Args:
+        points: Mảng chứa 4 điểm của contour/tứ giác.
+
+    Returns:
+        Mảng `np.ndarray` kích thước `(4, 2)` theo thứ tự chuẩn.
+    """
     pts = points.reshape(-1, 2).astype(np.float32)
     if pts.shape[0] != 4:
         raise ValueError("Expected 4 points to order a quadrilateral")
 
     ordered = np.zeros((4, 2), dtype=np.float32)
+    # Mẹo hình học cổ điển:
+    # - Điểm có tổng (x+y) nhỏ nhất thường là góc trên-trái.
+    # - Điểm có tổng lớn nhất thường là góc dưới-phải.
     s = pts.sum(axis=1)
+    # Hiệu (x-y) giúp tách 2 góc còn lại:
+    # - Nhỏ nhất ~ trên-phải, lớn nhất ~ dưới-trái (theo hệ tọa độ ảnh OpenCV).
     d = np.diff(pts, axis=1).reshape(-1)
 
     ordered[0] = pts[np.argmin(s)]  # top-left
@@ -27,27 +47,69 @@ def _order_quad_points(points: np.ndarray) -> np.ndarray:
 
 
 def _box_to_quad(box: np.ndarray) -> np.ndarray:
-    """Convert an arbitrary contour to a stable 4-point quadrilateral."""
+    # Hàm phụ chuẩn hóa contour/box về dạng dễ xử lý.
+    """
+    Chuẩn hóa contour bất kỳ về tứ giác 4 điểm ổn định.
+
+    Quy trình:
+    1. Nếu contour đã có đúng 4 điểm thì chỉ cần sắp lại thứ tự chuẩn.
+    2. Nếu chưa đủ/không đúng 4 điểm, thử xấp xỉ polygon bằng `approxPolyDP`.
+    3. Nếu vẫn không được 4 điểm, fallback về `minAreaRect` để luôn có tứ giác hợp lệ.
+
+    Args:
+        box: Contour đầu vào (đa giác bất kỳ).
+
+    Returns:
+        Tứ giác 4 điểm đã chuẩn hóa thứ tự.
+    """
     contour = box.reshape(-1, 2).astype(np.float32)
     if contour.shape[0] == 4:
         return _order_quad_points(contour)
 
+    # Ưu tiên xấp xỉ polygon từ contour gốc để giữ biên sát thực tế.
     peri = cv2.arcLength(contour.reshape(-1, 1, 2), True)
     approx = cv2.approxPolyDP(contour.reshape(-1, 1, 2), 0.02 * peri, True)
     if approx.shape[0] == 4:
         return _order_quad_points(approx.reshape(-1, 2))
 
+    # Fallback cuối cùng: minAreaRect luôn trả 4 điểm ổn định ngay cả khi contour méo.
     rect = cv2.minAreaRect(contour.reshape(-1, 1, 2))
     quad = cv2.boxPoints(rect)
     return _order_quad_points(quad)
 
 
 def _lerp_point(p0: np.ndarray, p1: np.ndarray, t: float) -> np.ndarray:
+    # Hàm phụ nội suy tuyến tính giữa hai điểm.
+    """
+    Nội suy tuyến tính giữa hai điểm theo hệ số t.
+
+    Args:
+        p0: Điểm đầu.
+        p1: Điểm cuối.
+        t: Hệ số nội suy (0 -> p0, 1 -> p1).
+
+    Returns:
+        Điểm nội suy trên đoạn nối p0-p1.
+    """
     return p0 + (p1 - p0) * float(t)
 
 
 def _point_on_quad(quad: np.ndarray, u: float, v: float) -> np.ndarray:
-    """Bilinear interpolation on ordered quad with u,v in [0,1]."""
+    # Hàm phụ ánh xạ tọa độ trong miền chuẩn sang miền ảnh.
+    """
+    Nội suy song tuyến tính trên tứ giác đã sắp thứ tự với u, v thuộc [0, 1].
+
+    Args:
+        quad: Tứ giác 4 điểm theo thứ tự chuẩn.
+        u: Tọa độ chuẩn theo trục ngang, trong [0, 1].
+        v: Tọa độ chuẩn theo trục dọc, trong [0, 1].
+
+    Returns:
+        Điểm ảnh tương ứng sau khi ánh xạ từ miền chuẩn.
+    """
+    # Nội suy 2 bước:
+    # 1) Nội suy theo chiều ngang trên cạnh trên/dưới.
+    # 2) Nội suy theo chiều dọc giữa 2 điểm vừa tìm được.
     top = _lerp_point(quad[0], quad[1], u)
     bottom = _lerp_point(quad[3], quad[2], u)
     return _lerp_point(top, bottom, v)
@@ -60,8 +122,24 @@ def _inner_quad(
     end_offset_x: float,
     end_offset_y: float,
 ) -> np.ndarray:
+    # Hàm phụ co vùng quan tâm để giảm nhiễu biên.
+    """
+    Tạo tứ giác vùng làm việc bên trong từ tứ giác gốc và các offset đầu/cuối.
+
+    Args:
+        quad: Tứ giác gốc của box.
+        start_offset_x: Tỉ lệ lùi đầu theo trục X.
+        start_offset_y: Tỉ lệ lùi đầu theo trục Y.
+        end_offset_x: Tỉ lệ lùi cuối theo trục X.
+        end_offset_y: Tỉ lệ lùi cuối theo trục Y.
+
+    Returns:
+        Tứ giác vùng trong sau khi áp offset và clamp an toàn.
+    """
+    # Clamp offset để không bị đảo hình hoặc co về diện tích âm.
     u0 = float(np.clip(start_offset_x, 0.0, 0.95))
     v0 = float(np.clip(start_offset_y, 0.0, 0.95))
+    # Bắt buộc u1 > u0 và v1 > v0 bằng epsilon nhỏ để tránh quad suy biến.
     u1 = float(np.clip(1.0 - end_offset_x, u0 + 1e-4, 1.0))
     v1 = float(np.clip(1.0 - end_offset_y, v0 + 1e-4, 1.0))
 
@@ -84,14 +162,31 @@ def _draw_grid_lines_on_quad(
     color: Tuple[int, int, int],
     thickness: int,
 ) -> None:
+    # Hàm hỗ trợ vẽ hình học/phần tử phụ trợ trong pipeline.
+    """
+    Vẽ lưới hàng/cột đều trên một tứ giác phối cảnh.
+
+    Args:
+        image: Ảnh đích để vẽ.
+        quad: Tứ giác vùng lưới.
+        grid_cols: Số cột lưới.
+        grid_rows: Số hàng lưới.
+        color: Màu đường lưới (BGR).
+        thickness: Độ dày nét vẽ.
+
+    Returns:
+        Không trả về giá trị.
+    """
     cv2.polylines(image, [quad.astype(np.int32)], True, color, thickness)
 
+    # Kẻ các line dọc bằng cách đi từ cạnh trên xuống cạnh dưới tại cùng tỉ lệ t.
     for col in range(1, grid_cols):
         t = col / float(grid_cols)
         p_top = _lerp_point(quad[0], quad[1], t)
         p_bottom = _lerp_point(quad[3], quad[2], t)
         cv2.line(image, tuple(np.round(p_top).astype(int)), tuple(np.round(p_bottom).astype(int)), color, thickness)
 
+    # Kẻ các line ngang bằng cách đi từ cạnh trái sang cạnh phải tại cùng tỉ lệ t.
     for row in range(1, grid_rows):
         t = row / float(grid_rows)
         p_left = _lerp_point(quad[0], quad[3], t)
@@ -108,12 +203,29 @@ def _draw_grid_cells_with_pattern(
     color: Tuple[int, int, int],
     thickness: int,
 ) -> None:
+    # Hàm hỗ trợ vẽ hình học/phần tử phụ trợ trong pipeline.
+    """
+    Vẽ các ô lưới theo pattern cột riêng cho từng hàng.
+
+    Args:
+        image: Ảnh đích để vẽ.
+        quad: Tứ giác vùng lưới.
+        grid_cols: Số cột tổng của lưới.
+        grid_rows: Số hàng tổng của lưới.
+        row_col_patterns: Danh sách cột được phép vẽ cho từng hàng.
+        color: Màu nét ô (BGR).
+        thickness: Độ dày nét vẽ.
+
+    Returns:
+        Không trả về giá trị.
+    """
     cv2.polylines(image, [quad.astype(np.int32)], True, color, thickness)
 
     if grid_cols <= 0 or grid_rows <= 0:
         return
 
     for row in range(grid_rows):
+        # Nếu có pattern thì chỉ vẽ các cột được phép ở hàng hiện tại.
         if row_col_patterns and row < len(row_col_patterns):
             cols_to_draw = row_col_patterns[row]
         else:
@@ -127,6 +239,7 @@ def _draw_grid_cells_with_pattern(
             u0 = col / float(grid_cols)
             u1 = (col + 1) / float(grid_cols)
 
+            # Mỗi cell vẫn là một quad phối cảnh, không giả định hình chữ nhật trục chuẩn.
             cell = np.array(
                 [
                     _point_on_quad(quad, u0, v0),
@@ -140,7 +253,17 @@ def _draw_grid_cells_with_pattern(
 
 
 def _validate_box_dims(box: np.ndarray, box_idx: int) -> Optional[Tuple[int, int, int, int]]:
-    """Return bounding rect when valid, otherwise print warning and return None."""
+    # Hàm hỗ trợ một bước xử lý trong pipeline chấm phiếu.
+    """
+    Kiểm tra kích thước box trước khi dùng để vẽ/chấm.
+
+    Args:
+        box: Contour box cần kiểm tra.
+        box_idx: Chỉ số box trong danh sách để in cảnh báo dễ theo dõi.
+
+    Returns:
+        Tuple `(x, y, w, h)` nếu hợp lệ, ngược lại trả về `None`.
+    """
     x, y, w, h = cv2.boundingRect(box)
     if w <= 0 or h <= 0:
         print(f"Warning: Box {box_idx} has invalid dimensions: {w}x{h}")
@@ -156,7 +279,21 @@ def _build_grid_info(
     grid_cols: int,
     extra: Optional[Dict[str, object]] = None,
 ) -> Optional[Dict[str, object]]:
-    """Build grid metadata dict shared by all grid extraction variants."""
+    # Hàm phụ dựng cấu trúc dữ liệu trung gian dùng lại nhiều nơi.
+    """
+    Tạo metadata lưới dùng chung cho các biến thể hàm trích xuất grid.
+
+    Args:
+        box_idx: Chỉ số box hiện tại.
+        box_bounds: Bounding rect của box `(x, y, w, h)`.
+        region_quad: Tứ giác vùng lưới sau khi áp offset.
+        grid_rows: Số hàng lưới.
+        grid_cols: Số cột lưới.
+        extra: Metadata phụ để gắn thêm theo từng bài toán.
+
+    Returns:
+        Dictionary metadata nếu vùng hợp lệ, ngược lại trả về `None`.
+    """
     _, _, region_width, region_height = cv2.boundingRect(region_quad.astype(np.int32))
     if region_width <= 0 or region_height <= 0:
         print(
@@ -181,6 +318,927 @@ def _build_grid_info(
     return info
 
 
+def _quad_cell_at(region_quad: np.ndarray, row: int, col: int, rows: int, cols: int) -> np.ndarray:
+    # Hàm phụ thao tác trên tứ giác phối cảnh.
+    """
+    Lấy tứ giác của một ô con theo chỉ số hàng/cột trong vùng tứ giác phối cảnh.
+
+    Args:
+        region_quad: Tứ giác vùng lưới.
+        row: Chỉ số hàng của ô.
+        col: Chỉ số cột của ô.
+        rows: Tổng số hàng.
+        cols: Tổng số cột.
+
+    Returns:
+        Tứ giác 4 điểm của ô cần lấy.
+    """
+    # Chia miền chuẩn [0,1]x[0,1] theo chỉ số hàng/cột rồi ánh xạ lại lên quad thực.
+    u0 = col / float(max(1, cols))
+    u1 = (col + 1) / float(max(1, cols))
+    v0 = row / float(max(1, rows))
+    v1 = (row + 1) / float(max(1, rows))
+
+    return np.array(
+        [
+            _point_on_quad(region_quad, u0, v0),
+            _point_on_quad(region_quad, u1, v0),
+            _point_on_quad(region_quad, u1, v1),
+            _point_on_quad(region_quad, u0, v1),
+        ],
+        dtype=np.float32,
+    )
+
+
+def _shrink_quad_towards_center(quad: np.ndarray, margin_ratio: float) -> np.ndarray:
+    # Hàm hỗ trợ một bước xử lý trong pipeline chấm phiếu.
+    """
+    Co tứ giác về tâm để giảm ảnh hưởng của viền lên phép đo fill-ratio.
+
+    Args:
+        quad: Tứ giác ô gốc.
+        margin_ratio: Tỉ lệ co về tâm.
+
+    Returns:
+        Tứ giác đã co, phù hợp để chấm vùng bên trong bubble.
+    """
+    # Giới hạn margin để giữ đủ diện tích đo; >0.45 thường làm mất vùng bubble có ích.
+    ratio = float(np.clip(margin_ratio, 0.0, 0.45))
+    if ratio <= 0:
+        return quad.astype(np.float32)
+
+    center = np.mean(quad.astype(np.float32), axis=0)
+    return center + (quad.astype(np.float32) - center) * (1.0 - ratio)
+
+
+def _fill_ratio_in_quad(binary_image: np.ndarray, quad: np.ndarray) -> float:
+    # Hàm phụ tính toán tỉ lệ/điểm số trong vùng quan tâm.
+    """
+    Tính tỉ lệ điểm trắng trong mặt nạ tứ giác.
+
+    Args:
+        binary_image: Ảnh nhị phân đầu vào.
+        quad: Tứ giác vùng cần chấm.
+
+    Returns:
+        Giá trị fill-ratio trong khoảng [0, 1].
+    """
+    if binary_image is None or binary_image.size == 0:
+        return 0.0
+
+    h, w = binary_image.shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    pts = np.round(quad).astype(np.int32)
+    pts[:, 0] = np.clip(pts[:, 0], 0, w - 1)
+    pts[:, 1] = np.clip(pts[:, 1], 0, h - 1)
+    cv2.fillConvexPoly(mask, pts, 255)
+
+    pixels = binary_image[mask > 0]
+    if pixels.size == 0:
+        return 0.0
+    # Ảnh binary dùng THRESH_BINARY_INV nên pixel != 0 tương ứng vùng tô đậm.
+    return float(np.count_nonzero(pixels)) / float(pixels.size)
+
+
+def _estimate_circle_from_quad(quad: np.ndarray, radius_scale: float = 0.46) -> Tuple[np.ndarray, float]:
+    # Hàm hỗ trợ một bước xử lý trong pipeline chấm phiếu.
+    """
+    Ước lượng tâm và bán kính bubble từ tứ giác của ô.
+
+    Quy trình:
+    1. Lấy tâm bằng trung bình 4 đỉnh.
+    2. Tính kích thước trung bình theo ngang/dọc của ô.
+    3. Chọn cạnh ngắn hơn làm chuẩn để tránh bán kính tràn viền ở ô méo.
+    4. Nhân với `radius_scale` (đã clip) để lấy bán kính cuối.
+
+    Args:
+        quad: Tứ giác của ô bubble.
+        radius_scale: Hệ số co bán kính so với nửa cạnh chuẩn.
+
+    Returns:
+        Tuple `(center, radius)` gồm tâm và bán kính ước lượng.
+    """
+    q = quad.astype(np.float32)
+    center = np.mean(q, axis=0)
+
+    top_w = float(np.linalg.norm(q[1] - q[0]))
+    bottom_w = float(np.linalg.norm(q[2] - q[3]))
+    left_h = float(np.linalg.norm(q[3] - q[0]))
+    right_h = float(np.linalg.norm(q[2] - q[1]))
+
+    avg_w = 0.5 * (top_w + bottom_w)
+    avg_h = 0.5 * (left_h + right_h)
+    # Lấy cạnh ngắn hơn để tránh bán kính tràn ra ngoài ô khi ô bị méo phối cảnh.
+    base_radius = 0.5 * min(avg_w, avg_h)
+    # Chặn scale ở khoảng an toàn để giảm outlier khi người dùng set tham số quá tay.
+    radius = max(1.0, base_radius * float(np.clip(radius_scale, 0.20, 0.60)))
+    return center, radius
+
+
+def _detect_single_circle_hough_in_quad(
+    binary_image: np.ndarray,
+    quad: np.ndarray,
+    radius_scale: float = 0.46,
+) -> Tuple[np.ndarray, float, bool]:
+    # Hàm hỗ trợ một bước xử lý trong pipeline chấm phiếu.
+    """
+    Phát hiện một vòng tròn bubble trong ô bằng Hough + NMS + gộp có trọng số.
+
+    Quy trình:
+    1. Ước lượng tâm/bán kính ban đầu từ hình học của ô.
+    2. Chạy Hough trên ROI đã mask để lấy nhiều candidate vòng tròn.
+    3. Chấm điểm candidate theo tín hiệu cạnh và độ phù hợp với prior hình học.
+    4. Dùng NMS để loại trùng, sau đó gộp cụm có trọng số để ổn định kết quả cuối.
+
+    Args:
+        binary_image: Ảnh nhị phân đầu vào.
+        quad: Tứ giác của ô bubble.
+        radius_scale: Hệ số ước lượng bán kính ban đầu.
+
+    Returns:
+        Tuple `(center, radius, found)` với:
+        - `center`: tâm vòng tròn.
+        - `radius`: bán kính vòng tròn.
+        - `found`: True nếu Hough tìm được candidate đáng tin cậy.
+    """
+    est_center, est_radius = _estimate_circle_from_quad(quad, radius_scale=radius_scale)
+    if binary_image is None or binary_image.size == 0:
+        return est_center, est_radius, False
+
+    h, w = binary_image.shape[:2]
+    pts = np.round(quad).astype(np.int32)
+    pts[:, 0] = np.clip(pts[:, 0], 0, w - 1)
+    pts[:, 1] = np.clip(pts[:, 1], 0, h - 1)
+
+    x, y, bw, bh = cv2.boundingRect(pts)
+    if bw < 8 or bh < 8:
+        return est_center, est_radius, False
+
+    roi = binary_image[y : y + bh, x : x + bw]
+    if roi.ndim == 3:
+        roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+
+    local_quad = pts.copy()
+    local_quad[:, 0] -= x
+    local_quad[:, 1] -= y
+
+    roi_mask = np.zeros((bh, bw), dtype=np.uint8)
+    cv2.fillConvexPoly(roi_mask, local_quad, 255)
+
+    # Chỉ giữ gradient trong ô hiện tại để Hough không bị nhiễu bởi ô lân cận.
+    masked = cv2.bitwise_and(roi, roi, mask=roi_mask)
+    prep = cv2.GaussianBlur(masked, (5, 5), 0)
+    edges = cv2.Canny(prep, 40, 120)
+
+    # Bó bán kính quanh estimate hình học để giảm nhảy kích thước giữa các frame/ảnh.
+    min_r = max(2, int(round(est_radius * 0.80)))
+    max_r = max(min_r + 1, int(round(est_radius * 1.10)))
+    min_dist = max(4, int(round(est_radius * 2.2)))
+
+    def _ring_edge_support(cx_local: float, cy_local: float, r_local: float) -> float:
+        # Hàm hỗ trợ một bước xử lý trong pipeline chấm phiếu.
+        # Đo mức "đỡ" theo biên: vòng tròn nào ăn khớp cạnh Canny tốt hơn sẽ được ưu tiên.
+        ring = np.zeros((bh, bw), dtype=np.uint8)
+        cxy = (int(round(cx_local)), int(round(cy_local)))
+        rr = max(1, int(round(r_local)))
+        cv2.circle(ring, cxy, rr, 255, 2)
+        ring = cv2.bitwise_and(ring, roi_mask)
+        denom = int(np.count_nonzero(ring))
+        if denom <= 0:
+            return 0.0
+        num = int(np.count_nonzero(cv2.bitwise_and(edges, ring)))
+        return float(num) / float(denom)
+
+    def _circle_iou(ca: Dict[str, float], cb: Dict[str, float]) -> float:
+        # Hàm phụ thao tác với hình tròn bubble/mặt nạ tròn.
+        # IoU hình tròn dùng để so mức trùng giữa hai candidate bất kể lệch tâm nhỏ.
+        r1 = float(max(1.0, ca["r"]))
+        r2 = float(max(1.0, cb["r"]))
+        dx = float(ca["cx"] - cb["cx"])
+        dy = float(ca["cy"] - cb["cy"])
+        d = float(np.hypot(dx, dy))
+
+        if d >= (r1 + r2):
+            inter = 0.0
+        elif d <= abs(r1 - r2):
+            inter = float(np.pi * min(r1, r2) ** 2)
+        else:
+            a1 = float(np.arccos(np.clip((d * d + r1 * r1 - r2 * r2) / (2.0 * d * r1), -1.0, 1.0)))
+            a2 = float(np.arccos(np.clip((d * d + r2 * r2 - r1 * r1) / (2.0 * d * r2), -1.0, 1.0)))
+            term = float((-d + r1 + r2) * (d + r1 - r2) * (d - r1 + r2) * (d + r1 + r2))
+            inter = r1 * r1 * a1 + r2 * r2 * a2 - 0.5 * np.sqrt(max(0.0, term))
+
+        area1 = float(np.pi * r1 * r1)
+        area2 = float(np.pi * r2 * r2)
+        union = area1 + area2 - inter
+        if union <= 1e-6:
+            return 0.0
+        return float(inter / union)
+
+    def _is_same_circle(ca: Dict[str, float], cb: Dict[str, float]) -> bool:
+        # Hàm hỗ trợ một bước xử lý trong pipeline chấm phiếu.
+        # Kết hợp 2 tiêu chí:
+        # - gần nhau về tâm + bán kính (nhanh)
+        # - hoặc IoU đủ lớn (an toàn khi bị méo nhẹ)
+        center_dist = float(np.hypot(ca["cx"] - cb["cx"], ca["cy"] - cb["cy"]))
+        radius_ref = float(max(1.0, max(ca["r"], cb["r"], est_radius)))
+        radius_diff = abs(float(ca["r"] - cb["r"])) / radius_ref
+        if center_dist <= 0.48 * radius_ref and radius_diff <= 0.34:
+            return True
+        return _circle_iou(ca, cb) >= 0.35
+
+    candidates: List[Dict[str, float]] = []
+    for dp in (1.1, 1.2):
+        for param2 in (10, 12, 14):
+            # Quét nhẹ nhiều cặp tham số Hough để tăng độ bền trên scan khó.
+            circles = cv2.HoughCircles(
+                prep,
+                cv2.HOUGH_GRADIENT,
+                dp=dp,
+                minDist=float(min_dist),
+                param1=80,
+                param2=param2,
+                minRadius=min_r,
+                maxRadius=max_r,
+            )
+            if circles is None or circles.size == 0:
+                continue
+
+            for c in circles[0][:8]:
+                cx_local = float(c[0])
+                cy_local = float(c[1])
+                rr = float(max(1.0, c[2]))
+
+                cx = cx_local + float(x)
+                cy = cy_local + float(y)
+                center_norm = float(np.hypot(cx - est_center[0], cy - est_center[1])) / float(max(1.0, est_radius))
+                radius_norm = abs(rr - float(est_radius)) / float(max(1.0, est_radius))
+                # prior_score: tin vào hình học; edge_score: tin vào tín hiệu cạnh thực.
+                prior_score = max(0.0, 1.0 - (0.70 * center_norm) - (0.60 * radius_norm))
+                edge_score = _ring_edge_support(cx_local, cy_local, rr)
+                score = (0.58 * edge_score) + (0.42 * prior_score)
+
+                candidates.append(
+                    {
+                        "cx": cx,
+                        "cy": cy,
+                        "r": rr,
+                        "score": float(score),
+                    }
+                )
+
+    if not candidates:
+        return est_center, est_radius, False
+
+    candidates = sorted(candidates, key=lambda it: float(it["score"]), reverse=True)
+
+    # NMS cứng để loại candidate gần trùng trước khi hợp cụm.
+    kept: List[Dict[str, float]] = []
+    for cand in candidates:
+        if any(_is_same_circle(cand, k) for k in kept):
+            continue
+        kept.append(cand)
+        if len(kept) >= 8:
+            break
+
+    if not kept:
+        return est_center, est_radius, False
+
+    # Hợp cụm bằng trung bình có trọng số score để ổn định tâm/bán kính đầu ra.
+    clusters: List[List[Dict[str, float]]] = [[] for _ in kept]
+    for cand in candidates:
+        best_idx = -1
+        best_dist = float("inf")
+        for idx_keep, keep in enumerate(kept):
+            if not _is_same_circle(cand, keep):
+                continue
+            dist = float(np.hypot(cand["cx"] - keep["cx"], cand["cy"] - keep["cy"]))
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = idx_keep
+        if best_idx >= 0:
+            clusters[best_idx].append(cand)
+
+    merged: List[Dict[str, float]] = []
+    for idx_keep, keep in enumerate(kept):
+        cluster = clusters[idx_keep] if clusters[idx_keep] else [keep]
+        ws = np.array([max(1e-3, float(c["score"])) for c in cluster], dtype=np.float32)
+        cx_vals = np.array([float(c["cx"]) for c in cluster], dtype=np.float32)
+        cy_vals = np.array([float(c["cy"]) for c in cluster], dtype=np.float32)
+        r_vals = np.array([float(c["r"]) for c in cluster], dtype=np.float32)
+
+        cxm = float(np.sum(ws * cx_vals) / np.sum(ws))
+        cym = float(np.sum(ws * cy_vals) / np.sum(ws))
+        rm = float(np.sum(ws * r_vals) / np.sum(ws))
+        # Candidate có nhiều phiếu bầu tương đồng sẽ được bonus nhẹ.
+        support_bonus = 0.08 * float(len(cluster) - 1)
+        base_score = float(np.max([float(c["score"]) for c in cluster])) + support_bonus
+
+        # Phạt nếu lệch quá xa estimate hình học ban đầu.
+        center_penalty = float(np.hypot(cxm - est_center[0], cym - est_center[1])) / float(max(1.0, est_radius))
+        radius_penalty = abs(rm - float(est_radius)) / float(max(1.0, est_radius))
+        final_score = base_score - (0.25 * center_penalty) - (0.20 * radius_penalty)
+
+        merged.append({"cx": cxm, "cy": cym, "r": max(1.0, rm), "score": final_score})
+
+    if not merged:
+        return est_center, est_radius, False
+
+    best = max(merged, key=lambda it: float(it["score"]))
+    return np.array([best["cx"], best["cy"]], dtype=np.float32), float(best["r"]), True
+
+
+def _circle_polygon(center: np.ndarray, radius: float, n_pts: int = 28) -> np.ndarray:
+    # Hàm phụ thao tác với hình tròn bubble/mặt nạ tròn.
+    """
+    Xấp xỉ hình tròn bằng polygon để vẽ overlay hoặc tạo mặt nạ.
+
+    Args:
+        center: Tâm vòng tròn.
+        radius: Bán kính vòng tròn.
+        n_pts: Số đỉnh polygon dùng để xấp xỉ.
+
+    Returns:
+        Mảng điểm polygon biểu diễn hình tròn.
+    """
+    cx, cy = float(center[0]), float(center[1])
+    rr = float(max(1.0, radius))
+    angles = np.linspace(0.0, 2.0 * np.pi, num=max(8, int(n_pts)), endpoint=False)
+    pts = np.stack([cx + rr * np.cos(angles), cy + rr * np.sin(angles)], axis=1)
+    return pts.astype(np.float32)
+
+
+def _fill_ratio_in_circle(
+    binary_image: np.ndarray,
+    quad: np.ndarray,
+    radius_scale: float = 0.46,
+    border_exclude_ratio: float = 0.10,
+    use_hough_detection: bool = False,
+) -> Tuple[float, np.ndarray, bool]:
+    # Hàm phụ tính toán tỉ lệ/điểm số trong vùng quan tâm.
+    """
+    Tính tỉ lệ điểm trắng bên trong vùng tròn bubble của một ô.
+
+    Hỗ trợ 2 chế độ:
+    - Ước lượng hình học đơn giản từ ô.
+    - Hough-circle để tăng độ bền khi bubble méo/nhòe.
+
+    Args:
+        binary_image: Ảnh nhị phân đầu vào.
+        quad: Tứ giác ô cần chấm.
+        radius_scale: Hệ số bán kính bubble.
+        border_exclude_ratio: Tỉ lệ bỏ viền ngoài bubble khi đo fill-ratio.
+        use_hough_detection: Bật/tắt chế độ Hough-circle.
+
+    Returns:
+        Tuple `(fill_ratio, score_poly, circle_found)` gồm:
+        - `fill_ratio`: tỉ lệ tô.
+        - `score_poly`: polygon vùng thực tế dùng để chấm.
+        - `circle_found`: True nếu Hough tìm được vòng tròn tin cậy.
+    """
+    if binary_image is None or binary_image.size == 0:
+        return 0.0, quad.astype(np.float32), False
+
+    h, w = binary_image.shape[:2]
+    qmask = np.zeros((h, w), dtype=np.uint8)
+    qpts = np.round(quad).astype(np.int32)
+    qpts[:, 0] = np.clip(qpts[:, 0], 0, w - 1)
+    qpts[:, 1] = np.clip(qpts[:, 1], 0, h - 1)
+    cv2.fillConvexPoly(qmask, qpts, 255)
+
+    def _score_for_circle(center_in: np.ndarray, outer_r_in: float) -> Tuple[float, float]:
+        # Hàm hỗ trợ một bước xử lý trong pipeline chấm phiếu.
+        # Loại viền ngoài của bubble (vốn hay đậm hơn nền) để giảm false-positive.
+        inner_r_local = outer_r_in * (1.0 - float(np.clip(border_exclude_ratio, 0.0, 0.4)))
+        inner_r_local = max(1.0, inner_r_local)
+
+        cmask = np.zeros((h, w), dtype=np.uint8)
+        cxy = tuple(np.round(center_in).astype(np.int32))
+        cv2.circle(cmask, cxy, int(round(inner_r_local)), 255, -1)
+
+        mask = cv2.bitwise_and(qmask, cmask)
+        pixels = binary_image[mask > 0]
+        if pixels.size == 0:
+            return 0.0, inner_r_local
+        return float(np.count_nonzero(pixels)) / float(pixels.size), inner_r_local
+
+    if use_hough_detection:
+        base_scale = float(np.clip(radius_scale, 0.20, 0.60))
+        # Thử thêm scale lân cận vì một scale cố định có thể hụt trên ô méo cục bộ.
+        candidate_scales: List[float] = []
+        for s in (base_scale, base_scale - 0.04, base_scale + 0.04):
+            s_clipped = float(np.clip(s, 0.20, 0.60))
+            if all(abs(s_clipped - existing) > 1e-6 for existing in candidate_scales):
+                candidate_scales.append(s_clipped)
+
+        best_ratio = -1.0
+        best_center: Optional[np.ndarray] = None
+        best_inner_r = 1.0
+        found_any = False
+        base_fallback: Optional[Tuple[float, np.ndarray, float]] = None
+
+        for s in candidate_scales:
+            center_s, outer_r_s, found_s = _detect_single_circle_hough_in_quad(
+                binary_image,
+                quad,
+                radius_scale=s,
+            )
+            ratio_s, inner_r_s = _score_for_circle(center_s, outer_r_s)
+
+            if abs(s - base_scale) <= 1e-6:
+                # Lưu phương án baseline để fallback khi Hough không tìm được vòng tròn nào.
+                base_fallback = (ratio_s, center_s, inner_r_s)
+
+            if not found_s:
+                continue
+
+            found_any = True
+            if ratio_s > best_ratio:
+                best_ratio = ratio_s
+                best_center = center_s
+                best_inner_r = inner_r_s
+
+        if found_any and best_center is not None:
+            return best_ratio, _circle_polygon(best_center, best_inner_r), True
+
+        if base_fallback is not None:
+            ratio_fb, center_fb, inner_r_fb = base_fallback
+            return ratio_fb, _circle_polygon(center_fb, inner_r_fb), False
+
+        center, outer_r = _estimate_circle_from_quad(quad, radius_scale=base_scale)
+        ratio, inner_r = _score_for_circle(center, outer_r)
+        return ratio, _circle_polygon(center, inner_r), False
+
+    center, outer_r = _estimate_circle_from_quad(quad, radius_scale=radius_scale)
+    ratio, inner_r = _score_for_circle(center, outer_r)
+    return ratio, _circle_polygon(center, inner_r), False
+
+
+def evaluate_grid_fill_from_binary(
+    binary_image: np.ndarray,
+    grid_info: List[Dict[str, object]],
+    fill_ratio_thresh: float,
+    inner_margin_ratio: float = 0.18,
+    mask_mode: str = "quad",
+    circle_radius_scale: float = 0.46,
+    circle_border_exclude_ratio: float = 0.10,
+) -> List[Dict[str, object]]:
+    # Đánh giá và trả về chỉ số/kết quả quyết định cho bước này.
+    """
+    Đánh giá tô/không tô cho từng ô lưới dựa trên fill-ratio của ảnh nhị phân.
+
+    Hỗ trợ ba chế độ mask:
+    - `quad`: chấm theo tứ giác ô.
+    - `circle`: chấm theo vùng tròn ước lượng.
+    - `hough-circle`: chấm theo vùng tròn có tinh chỉnh Hough.
+
+    Args:
+        binary_image: Ảnh nhị phân đầu vào.
+        grid_info: Metadata lưới của các box cần chấm.
+        fill_ratio_thresh: Ngưỡng phân loại ô tô.
+        inner_margin_ratio: Tỉ lệ co vùng chấm trong mỗi ô.
+        mask_mode: Chế độ mặt nạ (`quad`/`circle`/`hough-circle`).
+        circle_radius_scale: Hệ số bán kính bubble ở chế độ tròn.
+        circle_border_exclude_ratio: Tỉ lệ bỏ viền ngoài bubble.
+
+    Returns:
+        Danh sách dictionary kết quả cho từng ô (box, row, col, ratio, filled, ...).
+    """
+    evaluations: List[Dict[str, object]] = []
+    mode = str(mask_mode).lower()
+    # Chế độ circle/hough-circle dùng mask tròn để giảm nhiễu ở các góc của ô.
+    use_circle = mode in ("circle", "hough-circle")
+    use_hough_circle = mode == "hough-circle"
+
+    for info in grid_info:
+        if "region_quad" not in info or "grid_shape" not in info:
+            continue
+
+        region_quad = np.array(info["region_quad"], dtype=np.float32)
+        rows, cols = info["grid_shape"]
+        rows = int(rows)
+        cols = int(cols)
+        pattern = info.get("pattern")
+
+        for row in range(rows):
+            # Một số phần (đặc biệt Part III) có pattern cột đặc thù theo từng hàng.
+            if isinstance(pattern, list) and row < len(pattern):
+                cols_to_check = [int(c) for c in pattern[row] if 0 <= int(c) < cols]
+            else:
+                cols_to_check = list(range(cols))
+
+            for col in cols_to_check:
+                cell_quad = _quad_cell_at(region_quad, row=row, col=col, rows=rows, cols=cols)
+                inner_quad = _shrink_quad_towards_center(cell_quad, inner_margin_ratio)
+                if use_circle:
+                    # Ưu tiên đo trong vùng tròn để khớp hình bubble thực tế.
+                    fill_ratio, score_poly, circle_found = _fill_ratio_in_circle(
+                        binary_image,
+                        inner_quad,
+                        radius_scale=circle_radius_scale,
+                        border_exclude_ratio=circle_border_exclude_ratio,
+                        use_hough_detection=use_hough_circle,
+                    )
+                else:
+                    # Fallback mask tứ giác khi không dùng chế độ circle/hough-circle.
+                    fill_ratio = _fill_ratio_in_quad(binary_image, inner_quad)
+                    score_poly = inner_quad
+                    circle_found = False
+                evaluations.append(
+                    {
+                        "box_idx": int(info.get("box_idx", -1)),
+                        "row": row,
+                        "col": col,
+                        "fill_ratio": fill_ratio,
+                        "filled": fill_ratio >= float(fill_ratio_thresh),
+                        "cell_quad": score_poly,
+                        "mask_mode": "hough-circle" if use_hough_circle else ("circle" if use_circle else "quad"),
+                        "circle_detected": bool(circle_found),
+                    }
+                )
+
+    return evaluations
+
+
+def draw_filled_cells_overlay(
+    image: np.ndarray,
+    evaluations: List[Dict[str, object]],
+    color: Tuple[int, int, int] = (0, 255, 0),
+    alpha: float = 0.35,
+) -> np.ndarray:
+    # Vẽ lớp hiển thị phục vụ debug hoặc trực quan kết quả.
+    """
+    Vẽ lớp phủ trong suốt cho các ô được xác định là đã tô.
+
+    Args:
+        image: Ảnh gốc để vẽ.
+        evaluations: Danh sách kết quả chấm từng ô.
+        color: Màu phủ cho ô tô.
+        alpha: Độ trong suốt lớp phủ.
+
+    Returns:
+        Ảnh đã thêm overlay vùng ô tô.
+    """
+    if image is None or image.size == 0 or not evaluations:
+        return image
+
+    overlay = image.copy()
+    for item in evaluations:
+        if not bool(item.get("filled", False)):
+            continue
+        # Dùng đúng cell_quad đã chấm để overlay khớp chính xác với vùng score.
+        quad = np.round(np.array(item["cell_quad"], dtype=np.float32)).astype(np.int32)
+        cv2.fillConvexPoly(overlay, quad, color)
+
+    out = image.copy()
+    cv2.addWeighted(overlay, float(alpha), out, 1.0 - float(alpha), 0, out)
+    return out
+
+
+def draw_binary_fillratio_debug(
+    binary_image: np.ndarray,
+    evaluations: List[Dict[str, object]],
+    out_path: str,
+) -> None:
+    # Vẽ lớp hiển thị phục vụ debug hoặc trực quan kết quả.
+    """
+    Lưu ảnh debug gồm nền nhị phân và nhãn fill-ratio cho từng ô.
+
+    Args:
+        binary_image: Ảnh nhị phân đã dùng để chấm.
+        evaluations: Danh sách kết quả chấm fill-ratio.
+        out_path: Đường dẫn ảnh debug đầu ra.
+
+    Returns:
+        Không trả về giá trị.
+    """
+    if binary_image is None or binary_image.size == 0:
+        return
+
+    if binary_image.ndim == 2:
+        canvas = cv2.cvtColor(binary_image, cv2.COLOR_GRAY2BGR)
+    else:
+        canvas = binary_image.copy()
+
+    for item in evaluations:
+        quad = np.round(np.array(item["cell_quad"], dtype=np.float32)).astype(np.int32)
+        ratio = float(item.get("fill_ratio", 0.0))
+        filled = bool(item.get("filled", False))
+        color = (0, 255, 0) if filled else (0, 165, 255)
+
+        cv2.polylines(canvas, [quad], True, color, 1)
+
+        cxy = np.mean(quad, axis=0)
+        tx = int(cxy[0]) - 10
+        ty = int(cxy[1]) + 4
+        cv2.putText(
+            canvas,
+            f"{ratio:.2f}",
+            (tx, ty),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.28,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+
+    cv2.imwrite(out_path, canvas)
+
+
+def _print_fill_summary(title: str, evaluations: List[Dict[str, object]], limit: int = 40) -> None:
+    # In tóm tắt nhanh để theo dõi chất lượng xử lý khi chạy.
+    """
+    In tóm tắt ngắn các ô đã tô cho một section lưới.
+
+    Args:
+        title: Tên section để hiển thị log.
+        evaluations: Danh sách kết quả chấm của section.
+        limit: Số dòng chi tiết tối đa cần in.
+
+    Returns:
+        Không trả về giá trị.
+    """
+    total = len(evaluations)
+    filled_items = [e for e in evaluations if bool(e.get("filled", False))]
+    hough_items = [e for e in evaluations if str(e.get("mask_mode", "")) == "hough-circle"]
+    if hough_items:
+        detected = sum(1 for e in hough_items if bool(e.get("circle_detected", False)))
+        print(f"{title}: filled {len(filled_items)}/{total}, hough circles {detected}/{len(hough_items)}")
+    else:
+        print(f"{title}: filled {len(filled_items)}/{total}")
+    for idx, item in enumerate(filled_items):
+        if idx >= limit:
+            print(f"  ... and {len(filled_items) - limit} more")
+            break
+        print(
+            f"  box={item['box_idx']} r={item['row']} c={item['col']} "
+            f"ratio={item['fill_ratio']:.3f}"
+        )
+
+
+def _mean_darkness_in_box_circle(
+    gray_image: np.ndarray,
+    box: np.ndarray,
+    radius_scale: float = 0.36,
+) -> float:
+    # Hàm phụ tính đặc trưng trung bình để phục vụ suy luận.
+    """
+    Tính độ tối trung bình (mức xám) trong vòng tròn trung tâm của box.
+
+    Args:
+        gray_image: Ảnh xám đầu vào.
+        box: Contour box bubble.
+        radius_scale: Hệ số bán kính vùng đo.
+
+    Returns:
+        Giá trị mean-darkness (0 là tối nhất, 255 là sáng nhất).
+    """
+    if gray_image is None or gray_image.size == 0:
+        return 255.0
+
+    x, y, w, h = cv2.boundingRect(box)
+    if w <= 0 or h <= 0:
+        return 255.0
+
+    cx = x + (w // 2)
+    cy = y + (h // 2)
+    # Bán kính đo darkness nhỏ hơn bán kính bubble một chút để bớt dính viền.
+    rr = max(2, int(round(min(w, h) * float(np.clip(radius_scale, 0.15, 0.48)))))
+
+    x1 = max(0, cx - rr)
+    y1 = max(0, cy - rr)
+    x2 = min(gray_image.shape[1], cx + rr + 1)
+    y2 = min(gray_image.shape[0], cy + rr + 1)
+
+    roi = gray_image[y1:y2, x1:x2]
+    if roi.size == 0:
+        return 255.0
+
+    mask = np.zeros(roi.shape, dtype=np.uint8)
+    local_center = (cx - x1, cy - y1)
+    # Chặn bán kính theo ROI để không vượt biên trong trường hợp box sát mép ảnh.
+    local_radius = max(1, min(rr, min(roi.shape[0], roi.shape[1]) // 2))
+    cv2.circle(mask, local_center, local_radius, 255, -1)
+
+    pixels = roi[mask > 0]
+    if pixels.size == 0:
+        return 255.0
+    return float(np.mean(pixels))
+
+
+def evaluate_digit_rows_mean_darkness(
+    gray_image: np.ndarray,
+    aligned_rows: List[Optional[List[np.ndarray]]],
+    expected_cols: int,
+    radius_scale: float = 0.36,
+    abs_darkness_threshold: float = 180.0,
+    min_second_gap: float = 12.0,
+    min_median_gap: float = 18.0,
+    min_abs_median_gap: float = 8.0,
+    min_abs_second_gap: float = 8.0,
+) -> Dict[str, object]:
+    # Đánh giá và trả về chỉ số/kết quả quyết định cho bước này.
+    """
+    Chọn một bubble tô cho mỗi cột dựa trên giá trị mean-darkness nhỏ nhất theo hàng.
+
+    Quy trình:
+    1. Với mỗi cột, tính mean-darkness cho tất cả hàng hợp lệ.
+    2. Lấy hàng tối nhất làm ứng viên.
+    3. Kiểm tra độ cách biệt với ứng viên thứ hai/median để giảm nhầm lẫn.
+    4. Trả về chuỗi giải mã và metadata quyết định theo từng cột.
+
+    Args:
+        gray_image: Ảnh xám đầu vào.
+        aligned_rows: Danh sách hàng box đã căn chỉnh theo chỉ số hàng.
+        expected_cols: Số cột cần giải mã.
+        radius_scale: Hệ số bán kính vùng đo darkness.
+        abs_darkness_threshold: Ngưỡng darkness tuyệt đối.
+        min_second_gap: Chênh lệch tối thiểu so với lựa chọn thứ hai.
+        min_median_gap: Chênh lệch tối thiểu so với median của cột.
+        min_abs_median_gap: Ngưỡng median-gap khi dùng điều kiện tuyệt đối.
+        min_abs_second_gap: Ngưỡng second-gap khi dùng điều kiện tuyệt đối.
+
+    Returns:
+        Dictionary gồm chuỗi decode, danh sách đánh giá, và quyết định theo cột.
+    """
+    evaluations: List[Dict[str, object]] = []
+    decoded_chars: List[str] = []
+    column_decisions: List[Dict[str, object]] = []
+
+    if expected_cols <= 0:
+        return {
+            "decoded": "",
+            "evaluations": evaluations,
+        }
+
+    for col in range(expected_cols):
+        # So sánh theo cột: mỗi cột chỉ được chọn tối đa 1 hàng (1 chữ số).
+        col_items: List[Dict[str, object]] = []
+        for row_idx, row in enumerate(aligned_rows):
+            if row is None or col >= len(row):
+                col_items.append(
+                    {
+                        "row": row_idx,
+                        "col": col,
+                        "mean_darkness": 255.0,
+                        "filled": False,
+                        "box": None,
+                        "valid": False,
+                    }
+                )
+                continue
+
+            box = row[col]
+            darkness = _mean_darkness_in_box_circle(gray_image, box, radius_scale=radius_scale)
+            col_items.append(
+                {
+                    "row": row_idx,
+                    "col": col,
+                    "mean_darkness": darkness,
+                    "filled": False,
+                    "box": box,
+                    "valid": True,
+                }
+            )
+
+        valid_items = [it for it in col_items if it["valid"]]
+        if valid_items:
+            # Hàng có darkness thấp nhất là ứng viên được tô đậm nhất.
+            sorted_items = sorted(valid_items, key=lambda it: float(it["mean_darkness"]))
+            best_item = sorted_items[0]
+            best_dark = float(best_item["mean_darkness"])
+            second_dark = float(sorted_items[1]["mean_darkness"]) if len(sorted_items) > 1 else 255.0
+            median_dark = float(np.median([float(it["mean_darkness"]) for it in sorted_items]))
+
+            has_abs_dark = best_dark <= float(abs_darkness_threshold)
+            second_gap = second_dark - best_dark
+            median_gap = median_dark - best_dark
+            # Cần có khoảng cách đủ lớn so với phần còn lại để tránh nhận nhầm cột nhiễu.
+            has_gap = second_gap >= float(min_second_gap) and median_gap >= float(min_median_gap)
+            has_context_for_abs = (
+                median_gap >= float(min_abs_median_gap)
+                and second_gap >= float(min_abs_second_gap)
+            )
+            # Tránh gán filled khi cả cột gần như đồng đều (quá sáng hoặc quá tối đồng loạt).
+            col_filled = bool(has_gap or (has_abs_dark and has_context_for_abs))
+
+            if col_filled:
+                best_item["filled"] = True
+                decoded_chars.append(str(int(best_item["row"])))
+            else:
+                decoded_chars.append("?")
+
+            column_decisions.append(
+                {
+                    "col": col,
+                    "filled": col_filled,
+                    "best_row": int(best_item["row"]),
+                    "best_darkness": best_dark,
+                    "second_darkness": second_dark,
+                    "median_darkness": median_dark,
+                    "second_gap": second_gap,
+                    "median_gap": median_gap,
+                }
+            )
+        else:
+            decoded_chars.append("?")
+            column_decisions.append(
+                {
+                    "col": col,
+                    "filled": False,
+                    "best_row": None,
+                    "best_darkness": 255.0,
+                    "second_darkness": 255.0,
+                    "median_darkness": 255.0,
+                    "second_gap": 0.0,
+                    "median_gap": 0.0,
+                }
+            )
+
+        evaluations.extend(col_items)
+
+    return {
+        "decoded": "".join(decoded_chars),
+        "evaluations": evaluations,
+        "column_decisions": column_decisions,
+    }
+
+
+def _print_digit_darkness_summary(title: str, result: Dict[str, object], limit: int = 20) -> None:
+    # In tóm tắt nhanh để theo dõi chất lượng xử lý khi chạy.
+    """
+    In tóm tắt ngắn kết quả giải mã chữ số theo mean-darkness.
+
+    Args:
+        title: Tên section (SoBaoDanh/MaDe).
+        result: Kết quả trả về từ hàm giải mã darkness.
+        limit: Số dòng chi tiết tối đa cần in.
+
+    Returns:
+        Không trả về giá trị.
+    """
+    decoded = str(result.get("decoded", ""))
+    evals = [e for e in result.get("evaluations", []) if bool(e.get("filled", False))]
+    decisions = result.get("column_decisions", [])
+    if isinstance(decisions, list):
+        filled_cols = sum(1 for d in decisions if bool(d.get("filled", False)))
+        print(f"{title} filled columns: {filled_cols}/{len(decisions)}")
+    print(f"{title} decoded: {decoded}")
+    for idx, item in enumerate(evals):
+        if idx >= limit:
+            print(f"  ... and {len(evals) - limit} more")
+            break
+        print(
+            f"  col={item['col']} digit={item['row']} darkness={item['mean_darkness']:.1f}"
+        )
+
+
+def draw_digit_darkness_overlay(
+    image: np.ndarray,
+    result: Dict[str, object],
+    color: Tuple[int, int, int],
+    alpha: float = 0.40,
+) -> np.ndarray:
+    # Vẽ lớp hiển thị phục vụ debug hoặc trực quan kết quả.
+    """
+    Vẽ vòng tròn trong suốt cho các bubble được chọn bởi bộ giải mã mean-darkness.
+
+    Args:
+        image: Ảnh gốc để vẽ.
+        result: Kết quả giải mã mean-darkness.
+        color: Màu phủ vòng tròn bubble được chọn.
+        alpha: Độ trong suốt lớp phủ.
+
+    Returns:
+        Ảnh đã thêm overlay cho các bubble được chọn.
+    """
+    if image is None or image.size == 0:
+        return image
+
+    evaluations = result.get("evaluations", [])
+    if not isinstance(evaluations, list) or not evaluations:
+        return image
+
+    overlay = image.copy()
+    for item in evaluations:
+        if not bool(item.get("filled", False)):
+            continue
+        box = item.get("box")
+        if box is None:
+            continue
+
+        x, y, w, h = cv2.boundingRect(np.array(box))
+        cx = x + (w // 2)
+        cy = y + (h // 2)
+        rr = max(2, int(round(min(w, h) * 0.36)))
+        cv2.circle(overlay, (cx, cy), rr, color, -1)
+        cv2.circle(overlay, (cx, cy), rr, tuple(max(0, c - 80) for c in color), 1)
+
+    out = image.copy()
+    cv2.addWeighted(overlay, float(alpha), out, 1.0 - float(alpha), 0, out)
+    return out
+
+
 def extract_grid_from_boxes_custom_pattern(
     image: np.ndarray,
     boxes: List[np.ndarray],
@@ -194,30 +1252,38 @@ def extract_grid_from_boxes_custom_pattern(
     grid_thickness: int = 1,
     row_col_patterns: Optional[List[List[int]]] = None,
 ) -> Dict[str, object]:
+    # Trích xuất vùng/lưới theo cấu hình hình học của phần tương ứng.
     """
-    Draw a grid on each box with custom cell patterns per row.
-    
+    Vẽ lưới cho từng box với pattern cột tùy biến theo từng hàng.
+
+    Quy trình:
+    1. Chuẩn hóa contour box về tứ giác ổn định.
+    2. Co vùng làm việc theo start/end offset để tránh dính viền.
+    3. Nếu có `row_col_patterns`, chỉ vẽ những ô thuộc cột được chỉ định ở mỗi hàng.
+    4. Thu thập `grid_info` để dùng lại cho bước chấm fill-ratio.
+
     Args:
-        image: Input image (will be modified in place)
-        boxes: List of boxes (as numpy arrays with polygon coordinates)
-        grid_cols: Number of columns in grid (default 4)
-        grid_rows: Number of rows in grid (default 12)
-        start_offset_ratio_x: Offset ratio for X axis (default 0.2 = 20%)
-        start_offset_ratio_y: Offset ratio for Y axis (default 0.1 = 10%)
-        end_offset_ratio_x: End offset ratio for X axis (from right, default 0.0 = 0%)
-        end_offset_ratio_y: End offset ratio for Y axis (from bottom, default 0.0 = 0%)
-        grid_color: Color for grid lines (BGR tuple, default green)
-        grid_thickness: Thickness of grid lines (default 1)
-        row_col_patterns: List of column indices for each row.
-                         E.g., [[0], [1, 2], [0, 1, 2, 3], ...] for custom patterns
-                         If None, draw all columns normally
-    
+        image: Ảnh đầu vào (hàm sẽ vẽ trực tiếp lên bản sao của ảnh này).
+        boxes: Danh sách box dạng contour polygon (numpy array).
+        grid_cols: Số cột của lưới (mặc định 4).
+        grid_rows: Số hàng của lưới (mặc định 12).
+        start_offset_ratio_x: Tỉ lệ lùi từ biên trái theo trục X (mặc định 0.2 = 20%).
+        start_offset_ratio_y: Tỉ lệ lùi từ biên trên theo trục Y (mặc định 0.1 = 10%).
+        end_offset_ratio_x: Tỉ lệ lùi từ biên phải theo trục X (mặc định 0.0).
+        end_offset_ratio_y: Tỉ lệ lùi từ biên dưới theo trục Y (mặc định 0.0).
+        grid_color: Màu đường lưới theo định dạng BGR (mặc định xanh lá).
+        grid_thickness: Độ dày đường lưới (mặc định 1).
+        row_col_patterns:
+            Danh sách pattern cột cho từng hàng.
+            Ví dụ: [[0], [1, 2], [0, 1, 2, 3], ...].
+            Nếu None thì vẽ đủ tất cả cột ở mọi hàng.
+
     Returns:
-        Dictionary with:
-        - 'image_with_grid': Image with grid drawn on it
-        - 'grid_info': List of grid metadata (position, size, etc)
+        Dictionary gồm:
+        - 'image_with_grid': Ảnh đã vẽ lưới.
+        - 'grid_info': Danh sách metadata của từng box/lưới để chấm đáp án.
     """
-    # Create a copy to draw on
+    # Tạo bản sao để không làm thay đổi ảnh gốc truyền vào.
     output_image = image.copy()
     grid_info = []
     
@@ -288,51 +1354,52 @@ def extract_grid_from_boxes_variable_offsets(
     grid_color: Tuple[int, int, int] = (0, 255, 0),
     grid_thickness: int = 1,
 ) -> Dict[str, object]:
+    # Trích xuất vùng/lưới theo cấu hình hình học của phần tương ứng.
     """
-    Draw a grid on each box with variable offset ratios per box.
-    
-    For each box:
-    1. Use offset from start_offset_ratios[box_idx] or default to (0.2, 0.1)
-    2. Calculate start point: x_start = x + offset_x * width, 
-                             y_start = y + offset_y * height
-     3. Calculate end point from end offsets:
-         - x_end by end_offset_x (from right)
-         - y_end by end_offset_y (from bottom)
-    4. Draw grid_cols x grid_rows cells with lines
-    
+    Vẽ lưới cho từng box với offset riêng theo từng box.
+
+    Với mỗi box:
+    1. Lấy offset bắt đầu từ `start_offset_ratios[box_idx]` hoặc dùng mặc định (0.2, 0.1).
+    2. Suy ra vùng làm việc từ offset đầu/cuối theo trục X, Y.
+    3. Vẽ lưới `grid_cols x grid_rows` theo phối cảnh của tứ giác box.
+    4. Lưu metadata lưới để phục vụ bước đánh giá ô tô.
+
     Args:
-        image: Input image (will be modified in place)
-        boxes: List of boxes (as numpy arrays with polygon coordinates)
-        grid_cols: Number of columns in grid (default 4)
-        grid_rows: Number of rows in grid (default 10)
-        start_offset_ratios: List of (offset_x, offset_y) tuples per box.
-                            If None or fewer than len(boxes), use (0.2, 0.1) as default
-        end_offset_ratios_x: List of end X offset ratios (from right).
-                    If None or fewer than len(boxes), use 0.0
-        end_offset_ratios_y: List of end Y offset ratios (from bottom).
-                            If None or fewer than len(boxes), use full height
-        grid_color: Color for grid lines (BGR tuple, default green)
-        grid_thickness: Thickness of grid lines (default 1)
-    
+        image: Ảnh đầu vào (hàm sẽ vẽ lên bản sao của ảnh này).
+        boxes: Danh sách box dạng contour polygon (numpy array).
+        grid_cols: Số cột lưới (mặc định 4).
+        grid_rows: Số hàng lưới (mặc định 10).
+        start_offset_ratios:
+            Danh sách tuple `(offset_x, offset_y)` cho từng box.
+            Nếu thiếu hoặc None thì dùng mặc định `(0.2, 0.1)`.
+        end_offset_ratios_x:
+            Danh sách tỉ lệ offset cuối theo trục X (tính từ biên phải).
+            Nếu thiếu hoặc None thì dùng `0.0`.
+        end_offset_ratios_y:
+            Danh sách tỉ lệ offset cuối theo trục Y (tính từ biên dưới).
+            Nếu thiếu hoặc None thì dùng `0.0`.
+        grid_color: Màu đường lưới theo định dạng BGR.
+        grid_thickness: Độ dày đường lưới.
+
     Returns:
-        Dictionary with:
-        - 'image_with_grid': Image with grid drawn on it
-        - 'grid_info': List of grid metadata (position, size, etc)
+        Dictionary gồm:
+        - 'image_with_grid': Ảnh đã vẽ lưới.
+        - 'grid_info': Danh sách metadata của từng box/lưới.
     """
-    # Create a copy to draw on
+    # Tạo bản sao để không làm thay đổi ảnh gốc truyền vào.
     output_image = image.copy()
     grid_info = []
     
     default_offset = (0.2, 0.1)
     
     for box_idx, box in enumerate(boxes):
-        # Get offset ratio for this box
+        # Lấy offset đầu cho box hiện tại.
         if start_offset_ratios and box_idx < len(start_offset_ratios):
             offset_x, offset_y = start_offset_ratios[box_idx]
         else:
             offset_x, offset_y = default_offset
         
-        # Get end offsets if specified
+        # Lấy offset cuối theo trục X, Y nếu có cung cấp riêng.
         end_offset_x = 0.0
         if end_offset_ratios_x and box_idx < len(end_offset_ratios_x):
             end_offset_x = end_offset_ratios_x[box_idx]
@@ -390,29 +1457,31 @@ def extract_grid_from_boxes(
     grid_color: Tuple[int, int, int] = (0, 255, 0),
     grid_thickness: int = 1,
 ) -> Dict[str, object]:
+    # Trích xuất vùng/lưới theo cấu hình hình học của phần tương ứng.
     """
-    Draw a grid on each box in the image.
-    
-    Draw a perspective-aware grid on each box with start/end offsets for both axes.
-    
+    Vẽ lưới chuẩn cho từng box trên ảnh.
+
+    Hàm này dùng một bộ offset chung cho tất cả box.
+    Lưới được vẽ theo phối cảnh của contour (không giả định hình chữ nhật trục chuẩn).
+
     Args:
-        image: Input image (will be modified in place)
-        boxes: List of boxes (as numpy arrays with polygon coordinates)
-        grid_cols: Number of columns in grid (default 4)
-        grid_rows: Number of rows in grid (default 10)
-        start_offset_ratio_x: Offset ratio for X axis (default 0.2 = 20%)
-        start_offset_ratio_y: Offset ratio for Y axis (default 0.1 = 10%)
-        end_offset_ratio_x: End offset ratio for X axis (from right, default 0.0)
-        end_offset_ratio_y: End offset ratio for Y axis (from bottom, default 0.0)
-        grid_color: Color for grid lines (BGR tuple, default green)
-        grid_thickness: Thickness of grid lines (default 1)
-    
+        image: Ảnh đầu vào (hàm sẽ vẽ lên bản sao của ảnh này).
+        boxes: Danh sách box dạng contour polygon.
+        grid_cols: Số cột lưới (mặc định 4).
+        grid_rows: Số hàng lưới (mặc định 10).
+        start_offset_ratio_x: Tỉ lệ lùi đầu theo trục X (mặc định 0.2).
+        start_offset_ratio_y: Tỉ lệ lùi đầu theo trục Y (mặc định 0.1).
+        end_offset_ratio_x: Tỉ lệ lùi cuối theo trục X từ biên phải (mặc định 0.0).
+        end_offset_ratio_y: Tỉ lệ lùi cuối theo trục Y từ biên dưới (mặc định 0.0).
+        grid_color: Màu đường lưới (BGR).
+        grid_thickness: Độ dày đường lưới.
+
     Returns:
-        Dictionary with:
-        - 'image_with_grid': Image with grid drawn on it
-        - 'grid_info': List of grid metadata (position, size, etc)
+        Dictionary gồm:
+        - 'image_with_grid': Ảnh đã vẽ lưới.
+        - 'grid_info': Metadata của từng vùng lưới để phục vụ chấm.
     """
-    # Create a copy to draw on
+    # Tạo bản sao để giữ nguyên ảnh đầu vào.
     output_image = image.copy()
     grid_info = []
     
@@ -465,7 +1534,18 @@ def _filter_line_components_by_length(
     min_length: int,
     orientation: str,
 ) -> np.ndarray:
-    """Keep only connected line components whose main axis length >= min_length."""
+    # Hàm phụ lọc nhiễu hoặc loại bỏ phần tử không đạt điều kiện.
+    """
+    Chỉ giữ các thành phần đường liên thông có trục chính dài hơn ngưỡng.
+
+    Args:
+        line_mask: Ảnh nhị phân chứa các line đã tách.
+        min_length: Độ dài tối thiểu của thành phần cần giữ.
+        orientation: Hướng line cần xét (`vertical` hoặc `horizontal`).
+
+    Returns:
+        Ảnh mask sau lọc thành phần ngắn.
+    """
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(line_mask, connectivity=8)
     filtered = np.zeros_like(line_mask)
     axis = cv2.CC_STAT_HEIGHT if orientation == "vertical" else cv2.CC_STAT_WIDTH
@@ -482,7 +1562,18 @@ def _align_vertical_lengths_by_row(
     row_tolerance: int = 25,
     min_group_size: int = 2,
 ) -> np.ndarray:
-    """Extend parallel vertical lines in same row to same length, preserving angle."""
+    # Hàm phụ căn chỉnh dữ liệu để tăng tính ổn định đầu ra.
+    """
+    Kéo dài các line dọc trong cùng hàng về chiều dài tương đương để tăng ổn định.
+
+    Args:
+        vertical_mask: Ảnh mask line dọc.
+        row_tolerance: Ngưỡng lệch tâm Y để gom cùng một hàng line.
+        min_group_size: Số line tối thiểu để thực hiện căn chỉnh.
+
+    Returns:
+        Ảnh mask line dọc sau khi căn chỉnh chiều dài.
+    """
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(vertical_mask, connectivity=8)
 
     comps: List[Dict[str, int]] = []
@@ -566,7 +1657,28 @@ def detect_grid_points(
     block_offset: int = 7,
     debug_prefix: Optional[str] = None,
 ) -> Dict[str, object]:
-    """Detect grid intersections from morphological vertical/horizontal lines."""
+    # Phát hiện dữ liệu/đối tượng theo tiêu chí của bước này.
+    """
+    Phát hiện giao điểm lưới từ các đường dọc/ngang thu được bằng morphology.
+
+    Quy trình:
+    1. Nhị phân hóa ảnh bằng adaptive threshold.
+    2. Tách line dọc và line ngang bằng kernel morphology.
+    3. Lấy giao điểm giữa hai mask line.
+    4. Lọc connected components nhỏ để giữ các giao điểm hợp lệ.
+
+    Args:
+        image: Ảnh đầu vào.
+        vertical_scale: Tỉ lệ chiều dài kernel dọc theo chiều cao ảnh.
+        horizontal_scale: Tỉ lệ chiều dài kernel ngang theo chiều rộng ảnh.
+        min_point_area: Diện tích tối thiểu của giao điểm.
+        block_size: Kích thước block cho adaptive threshold.
+        block_offset: Hệ số C của adaptive threshold.
+        debug_prefix: Tiền tố lưu ảnh debug (nếu cần).
+
+    Returns:
+        Dictionary chứa các mask trung gian, overlay giao điểm và danh sách tọa độ điểm.
+    """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image.copy()
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
 
@@ -631,481 +1743,6 @@ def detect_grid_points(
     return debug_data
 
 
-def _cell_quad_from_grid(
-    region_quad: np.ndarray,
-    row: int,
-    col: int,
-    grid_rows: int,
-    grid_cols: int,
-) -> np.ndarray:
-    """Build one cell quad from grid row/col inside a region quad."""
-    v0 = row / float(grid_rows)
-    v1 = (row + 1) / float(grid_rows)
-    u0 = col / float(grid_cols)
-    u1 = (col + 1) / float(grid_cols)
-
-    return np.array(
-        [
-            _point_on_quad(region_quad, u0, v0),
-            _point_on_quad(region_quad, u1, v0),
-            _point_on_quad(region_quad, u1, v1),
-            _point_on_quad(region_quad, u0, v1),
-        ],
-        dtype=np.float32,
-    )
-
-
-def _analyze_polygon_fill_ratio(
-    binary_image: np.ndarray,
-    polygon: np.ndarray,
-    fill_ratio_thresh: float,
-    roi_inset_ratio: float = 0.10,
-) -> Dict[str, object]:
-    """Measure white-pixel ratio in a polygon on binary image and classify filled/empty."""
-    poly = polygon.reshape(-1, 2).astype(np.float32)
-    poly_i = np.round(poly).astype(np.int32)
-
-    # Inset ROI by ratio from each edge to reduce border-line contamination.
-    inset = float(np.clip(roi_inset_ratio, 0.0, 0.45))
-    if inset > 0.0:
-        m = cv2.moments(poly_i)
-        if abs(m["m00"]) > 1e-6:
-            cx = float(m["m10"] / m["m00"])
-            cy = float(m["m01"] / m["m00"])
-        else:
-            cx = float(np.mean(poly[:, 0]))
-            cy = float(np.mean(poly[:, 1]))
-
-        scale = max(0.05, 1.0 - (2.0 * inset))
-        roi_poly = np.empty_like(poly)
-        roi_poly[:, 0] = cx + (poly[:, 0] - cx) * scale
-        roi_poly[:, 1] = cy + (poly[:, 1] - cy) * scale
-    else:
-        roi_poly = poly.copy()
-
-    roi_poly_i = np.round(roi_poly).astype(np.int32)
-
-    h_img, w_img = binary_image.shape[:2]
-    x, y, w, h = cv2.boundingRect(roi_poly_i)
-    x0 = max(0, x)
-    y0 = max(0, y)
-    x1 = min(w_img, x + w)
-    y1 = min(h_img, y + h)
-
-    if x1 <= x0 or y1 <= y0:
-        return {
-            "fill_ratio": 0.0,
-            "is_filled": False,
-            "polygon": poly_i,
-            "roi_polygon": roi_poly_i,
-            "box_bounds": (x0, y0, x1, y1),
-        }
-
-    roi = binary_image[y0:y1, x0:x1]
-    local_poly = roi_poly_i.copy()
-    local_poly[:, 0] -= x0
-    local_poly[:, 1] -= y0
-
-    mask = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
-    cv2.fillPoly(mask, [local_poly], 255)
-
-    valid = mask > 0
-    valid_count = int(np.count_nonzero(valid))
-    if valid_count <= 0:
-        return {
-            "fill_ratio": 0.0,
-            "is_filled": False,
-            "polygon": poly_i,
-            "roi_polygon": roi_poly_i,
-            "box_bounds": (x0, y0, x1, y1),
-        }
-
-    white_count = int(np.count_nonzero((roi > 0) & valid))
-    fill_ratio = float(white_count) / float(valid_count)
-    is_filled = fill_ratio > float(fill_ratio_thresh)
-
-    return {
-        "fill_ratio": fill_ratio,
-        "is_filled": is_filled,
-        "polygon": poly_i,
-        "roi_polygon": roi_poly_i,
-        "box_bounds": (x0, y0, x1, y1),
-    }
-
-
-def _analyze_polygon_mean_darkness(
-    gray_image: np.ndarray,
-    polygon: np.ndarray,
-    roi_inset_ratio: float = 0.20,
-) -> Dict[str, object]:
-    """Measure mean darkness in an inset polygon on grayscale image."""
-    poly = polygon.reshape(-1, 2).astype(np.float32)
-    poly_i = np.round(poly).astype(np.int32)
-
-    inset = float(np.clip(roi_inset_ratio, 0.0, 0.45))
-    if inset > 0.0:
-        m = cv2.moments(poly_i)
-        if abs(m["m00"]) > 1e-6:
-            cx = float(m["m10"] / m["m00"])
-            cy = float(m["m01"] / m["m00"])
-        else:
-            cx = float(np.mean(poly[:, 0]))
-            cy = float(np.mean(poly[:, 1]))
-
-        scale = max(0.05, 1.0 - (2.0 * inset))
-        roi_poly = np.empty_like(poly)
-        roi_poly[:, 0] = cx + (poly[:, 0] - cx) * scale
-        roi_poly[:, 1] = cy + (poly[:, 1] - cy) * scale
-    else:
-        roi_poly = poly.copy()
-
-    roi_poly_i = np.round(roi_poly).astype(np.int32)
-
-    h_img, w_img = gray_image.shape[:2]
-    x, y, w, h = cv2.boundingRect(roi_poly_i)
-    x0 = max(0, x)
-    y0 = max(0, y)
-    x1 = min(w_img, x + w)
-    y1 = min(h_img, y + h)
-
-    if x1 <= x0 or y1 <= y0:
-        return {
-            "mean_darkness": 255.0,
-            "polygon": poly_i,
-            "roi_polygon": roi_poly_i,
-            "box_bounds": (x0, y0, x1, y1),
-        }
-
-    roi = gray_image[y0:y1, x0:x1]
-    local_poly = roi_poly_i.copy()
-    local_poly[:, 0] -= x0
-    local_poly[:, 1] -= y0
-
-    mask = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
-    cv2.fillPoly(mask, [local_poly], 255)
-
-    valid = mask > 0
-    valid_count = int(np.count_nonzero(valid))
-    if valid_count <= 0:
-        return {
-            "mean_darkness": 255.0,
-            "polygon": poly_i,
-            "roi_polygon": roi_poly_i,
-            "box_bounds": (x0, y0, x1, y1),
-        }
-
-    mean_darkness = float(np.mean(roi[valid]))
-    return {
-        "mean_darkness": mean_darkness,
-        "polygon": poly_i,
-        "roi_polygon": roi_poly_i,
-        "box_bounds": (x0, y0, x1, y1),
-    }
-
-
-def evaluate_grid_cells_with_horizontal_binary(
-    original_image: np.ndarray,
-    horizontal_binary: np.ndarray,
-    part_i_grid_info: Optional[List[Dict[str, object]]] = None,
-    part_ii_grid_info: Optional[List[Dict[str, object]]] = None,
-    part_iii_grid_info: Optional[List[Dict[str, object]]] = None,
-    sobao_danh_rows: Optional[List[List[np.ndarray]]] = None,
-    ma_de_rows: Optional[List[List[np.ndarray]]] = None,
-    debug_prefix: Optional[str] = None,
-) -> Dict[str, object]:
-    """Classify filled/empty cells by matching grid polygons to horizontal-line binary image."""
-    result_image = original_image.copy()
-    fill_overlay = original_image.copy()
-    gray_image = cv2.cvtColor(original_image, cv2.COLOR_BGR2GRAY) if original_image.ndim == 3 else original_image.copy()
-
-    green = (0, 255, 0)
-    empty_color = (0, 165, 255)
-
-    all_items: List[Dict[str, object]] = []
-    draw_items: List[Dict[str, object]] = []
-
-    section_thresholds = {
-        "part_i": 0.095,
-        "part_ii": 0.095,
-        "part_iii": 0.095,
-    }
-
-    section_darkness_upper = {
-        "sobaodanh": 85.0,
-        "made": 85.0,
-    }
-
-    def _add_grid_section(
-        section_name: str,
-        infos: Optional[List[Dict[str, object]]],
-    ) -> None:
-        if not infos:
-            return
-
-        thresh = section_thresholds[section_name]
-        for info in infos:
-            region_quad = np.array(info["region_quad"], dtype=np.float32)
-            grid_rows, grid_cols = info["grid_shape"]
-            pattern = info.get("pattern")
-            box_idx = int(info["box_idx"])
-
-            for row in range(int(grid_rows)):
-                if pattern and row < len(pattern):
-                    cols = pattern[row]
-                else:
-                    cols = range(int(grid_cols))
-
-                for col in cols:
-                    if col < 0 or col >= int(grid_cols):
-                        continue
-
-                    cell_poly = _cell_quad_from_grid(region_quad, row, int(col), int(grid_rows), int(grid_cols))
-                    metric = _analyze_polygon_fill_ratio(horizontal_binary, cell_poly, thresh)
-
-                    all_items.append(
-                        {
-                            "section": section_name,
-                            "box_idx": box_idx,
-                            "row": row,
-                            "col": int(col),
-                            "filled": metric["is_filled"],
-                            "fill_ratio": metric["fill_ratio"],
-                            "box_bounds": metric["box_bounds"],
-                            "polygon": metric["polygon"],
-                            "metric_name": "fill_ratio",
-                            "metric_value": metric["fill_ratio"],
-                        }
-                    )
-                    draw_items.append(
-                        {
-                            "polygon": metric["polygon"],
-                            "filled": bool(metric["is_filled"]),
-                            "metric_name": "fill_ratio",
-                            "metric_value": float(metric["fill_ratio"]),
-                        }
-                    )
-
-    def _row_center_y(row: List[np.ndarray]) -> float:
-        centers: List[float] = []
-        for poly in row:
-            x, y, w, h = cv2.boundingRect(poly)
-            centers.append(y + (h / 2.0))
-        return float(np.mean(centers)) if centers else 0.0
-
-    def _add_id_rows_with_mean_darkness(
-        section_name: str,
-        rows: Optional[List[List[np.ndarray]]],
-    ) -> None:
-        if not rows:
-            return
-
-        sorted_rows = sorted(rows, key=_row_center_y)
-        normalized_rows: List[List[np.ndarray]] = []
-        for row in sorted_rows:
-            row_sorted = sorted(row, key=lambda p: cv2.boundingRect(p)[0])
-            if row_sorted:
-                normalized_rows.append(row_sorted)
-
-        if not normalized_rows:
-            return
-
-        max_cols = max(len(row) for row in normalized_rows)
-        darkness_upper = section_darkness_upper.get(section_name, 85.0)
-
-        for col_idx in range(max_cols):
-            col_items: List[Tuple[int, Dict[str, object]]] = []
-            for row_idx, row in enumerate(normalized_rows):
-                if col_idx >= len(row):
-                    continue
-                metric = _analyze_polygon_mean_darkness(gray_image, row[col_idx].reshape(-1, 2))
-                col_items.append((row_idx, metric))
-
-            if not col_items:
-                continue
-
-            best_row_idx, best_metric = min(col_items, key=lambda item: float(item[1]["mean_darkness"]))
-
-            # Keep behavior aligned with main_dynamic_threshold: choose darkest box per column.
-            best_darkness = float(best_metric["mean_darkness"])
-            use_winner = True
-
-            for row_idx, metric in col_items:
-                is_filled = bool(use_winner and row_idx == best_row_idx)
-                metric_darkness = float(metric["mean_darkness"])
-
-                all_items.append(
-                    {
-                        "section": section_name,
-                        "box_idx": row_idx,
-                        "row": row_idx,
-                        "col": col_idx,
-                        "filled": is_filled,
-                        "fill_ratio": 0.0,
-                        "mean_darkness": metric_darkness,
-                        "darkness_threshold": darkness_upper,
-                        "best_darkness_in_col": best_darkness,
-                        "box_bounds": metric["box_bounds"],
-                        "polygon": metric["polygon"],
-                        "metric_name": "mean_darkness",
-                        "metric_value": metric_darkness,
-                    }
-                )
-                draw_items.append(
-                    {
-                        "polygon": metric["polygon"],
-                        "filled": is_filled,
-                        "metric_name": "mean_darkness",
-                        "metric_value": metric_darkness,
-                    }
-                )
-
-    def _add_box_rows(
-        section_name: str,
-        rows: Optional[List[List[np.ndarray]]],
-    ) -> None:
-        if not rows:
-            return
-
-        if section_name in {"sobaodanh", "made"}:
-            _add_id_rows_with_mean_darkness(section_name, rows)
-            return
-
-        thresh = section_thresholds[section_name]
-        for row_idx, row in enumerate(rows):
-            for col_idx, poly in enumerate(row):
-                metric = _analyze_polygon_fill_ratio(horizontal_binary, poly.reshape(-1, 2), thresh)
-                all_items.append(
-                    {
-                        "section": section_name,
-                        "box_idx": row_idx,
-                        "row": row_idx,
-                        "col": col_idx,
-                        "filled": metric["is_filled"],
-                        "fill_ratio": metric["fill_ratio"],
-                        "box_bounds": metric["box_bounds"],
-                        "polygon": metric["polygon"],
-                        "metric_name": "fill_ratio",
-                        "metric_value": metric["fill_ratio"],
-                    }
-                )
-                draw_items.append(
-                    {
-                        "polygon": metric["polygon"],
-                        "filled": bool(metric["is_filled"]),
-                        "metric_name": "fill_ratio",
-                        "metric_value": float(metric["fill_ratio"]),
-                    }
-                )
-
-    _add_grid_section("part_i", part_i_grid_info)
-    _add_grid_section("part_ii", part_ii_grid_info)
-    _add_grid_section("part_iii", part_iii_grid_info)
-    _add_box_rows("sobaodanh", sobao_danh_rows)
-    _add_box_rows("made", ma_de_rows)
-
-    for draw in draw_items:
-        poly = np.array(draw["polygon"], dtype=np.int32)
-        is_filled = bool(draw["filled"])
-        if is_filled:
-            cv2.fillPoly(fill_overlay, [poly], green)
-
-    result_image = cv2.addWeighted(fill_overlay, 0.5, result_image, 0.5, 0)
-
-    for draw in draw_items:
-        poly = np.array(draw["polygon"], dtype=np.int32)
-        is_filled = bool(draw["filled"])
-        color = green if is_filled else empty_color
-        thickness = 2 if is_filled else 1
-        cv2.polylines(result_image, [poly], True, color, thickness)
-
-    section_summary: Dict[str, Dict[str, int]] = {}
-    for item in all_items:
-        sec = str(item["section"])
-        if sec not in section_summary:
-            section_summary[sec] = {"total": 0, "filled": 0}
-        section_summary[sec]["total"] += 1
-        if bool(item["filled"]):
-            section_summary[sec]["filled"] += 1
-
-    if debug_prefix:
-        # Binary debug with per-cell fill ratio annotations.
-        ratio_debug = cv2.cvtColor(horizontal_binary, cv2.COLOR_GRAY2BGR)
-        for draw in draw_items:
-            poly = np.array(draw["polygon"], dtype=np.int32)
-            is_filled = bool(draw["filled"])
-            metric_name = str(draw.get("metric_name", "fill_ratio"))
-            metric_value = float(draw.get("metric_value", 0.0))
-
-            border_color = (0, 255, 0) if is_filled else (0, 200, 255)
-            cv2.polylines(ratio_debug, [poly], True, border_color, 1)
-
-            m = cv2.moments(poly)
-            if abs(m["m00"]) > 1e-6:
-                cx = int(m["m10"] / m["m00"])
-                cy = int(m["m01"] / m["m00"])
-            else:
-                x, y, w, h = cv2.boundingRect(poly)
-                cx = x + (w // 2)
-                cy = y + (h // 2)
-
-            label = f"{metric_value:.2f}" if metric_name == "fill_ratio" else f"D{metric_value:.0f}"
-            text_org = (max(0, cx - 10), max(10, cy + 4))
-            cv2.putText(ratio_debug, label, text_org, cv2.FONT_HERSHEY_SIMPLEX, 0.26, (0, 0, 0), 2)
-            cv2.putText(ratio_debug, label, text_org, cv2.FONT_HERSHEY_SIMPLEX, 0.26, (255, 255, 255), 1)
-
-        cv2.imwrite(f"{debug_prefix}_horizontal_binary.jpg", horizontal_binary)
-        cv2.imwrite(f"{debug_prefix}_horizontal_fill_ratio_debug.jpg", ratio_debug)
-        cv2.imwrite(f"{debug_prefix}_grid_filled_from_horizontal.jpg", result_image)
-
-    return {
-        "items": all_items,
-        "summary": section_summary,
-        "visualization": result_image,
-    }
-
-
-def detect_boxes_in_region(
-    region: np.ndarray,
-    min_box_area: int = 50,
-    min_box_width: int = 5,
-    min_box_height: int = 5,
-) -> List[np.ndarray]:
-    """
-    Detect small boxes within a specific image region.
-    Used for detecting answer boxes inside SoBaoDanh containers.
-    """
-    # Apply adaptive threshold to the region
-    if region.ndim == 3:
-        gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = region.copy()
-    
-    blur = cv2.GaussianBlur(gray, (3, 3), 0)
-    _, binary = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    
-    # Detect contours
-    contours, _ = cv2.findContours(binary, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-    
-    boxes = []
-    for contour in contours:
-        area = cv2.contourArea(contour)
-        if area < min_box_area:
-            continue
-        
-        x, y, w, h = cv2.boundingRect(contour)
-        if w < min_box_width or h < min_box_height:
-            continue
-        
-        epsilon = 0.005 * cv2.arcLength(contour, True)
-        approx = cv2.approxPolyDP(contour, epsilon, True)
-        boxes.append(approx)
-    
-    # Sort boxes by position (top-left to bottom-right)
-    boxes.sort(key=lambda b: (int(b[0, 0, 1]), int(b[0, 0, 0])))
-    
-    return boxes
-
-
 def _split_merged_boxes_for_grouping(
     boxes: List[np.ndarray],
     split_wide: bool = False,
@@ -1113,7 +1750,20 @@ def _split_merged_boxes_for_grouping(
     min_area: int = 400,
     max_area: int = 10000,
 ) -> List[np.ndarray]:
-    """Split likely merged bubble boxes (wide or tall) to improve row grouping."""
+    # Hàm phụ tách phần tử gộp để phục hồi cấu trúc mong muốn.
+    """
+    Tách các box bubble có khả năng bị dính để nhóm hàng/cột chính xác hơn.
+
+    Args:
+        boxes: Danh sách contour box đầu vào.
+        split_wide: Bật tách box dính theo chiều ngang.
+        split_tall: Bật tách box dính theo chiều dọc.
+        min_area: Diện tích nhỏ nhất của box xét tách.
+        max_area: Diện tích lớn nhất của box xét tách.
+
+    Returns:
+        Danh sách box sau khi tách các contour dính.
+    """
     if not boxes:
         return boxes
 
@@ -1161,7 +1811,21 @@ def _separate_upper_id_boxes(
     max_area: int = 6000,
     row_tolerance: int = 20,
 ) -> Tuple[List[np.ndarray], List[np.ndarray], float]:
-    """Split upper ID region boxes into SoBaoDanh (left) and MaDe (right) by X split."""
+    # Hàm phụ chia dữ liệu thành các nhánh xử lý độc lập.
+    """
+    Tách box vùng ID phía trên thành SoBaoDanh (trái) và Mã đề (phải).
+
+    Args:
+        boxes: Danh sách box ứng viên vùng phía trên.
+        part_i_boxes: Danh sách box phần Part I để suy ra ngưỡng Y phía trên.
+        top_margin: Biên an toàn tính từ đỉnh Part I.
+        min_area: Diện tích tối thiểu cho box ID.
+        max_area: Diện tích tối đa cho box ID.
+        row_tolerance: Ngưỡng gom các box cùng hàng theo Y.
+
+    Returns:
+        Tuple `(sbd_boxes, ma_de_boxes, split_x)`.
+    """
     if not boxes:
         return [], [], 0.0
     if not part_i_boxes:
@@ -1222,18 +1886,30 @@ def group_boxes_into_parts(
     size_tolerance_ratio: float = 0.15,
     min_boxes_per_group: int = 3,
 ) -> Dict[str, object]:
+    # Gom nhóm dữ liệu để tạo cấu trúc phục vụ xử lý phía sau.
     """
-    Group detected boxes into Part I (4 boxes), Part II (8 boxes), Part III (6 boxes).
-    
-    Groups boxes by vertical position (rows), then identifies parts based on:
-    - Part I: First group with exactly 4 boxes of same size
-    - Part II: Middle group with 8 boxes
-    - Part III: Last group with 6 boxes
+    Gom nhóm box phát hiện được thành ba phần chính của phiếu: Part I, Part II, Part III.
+
+    Chiến lược:
+    1. Lọc các box ứng viên theo diện tích và loại trùng bằng IoU.
+    2. Gom box theo hàng theo trục Y.
+    3. Nhận diện lần lượt Part I (4), Part II (8), Part III (6) theo đặc trưng hình học.
+    4. Áp dụng nhiều nhánh fallback để phục hồi khi scan thiếu/méo contour.
+
+    Args:
+        boxes: Danh sách contour box phát hiện từ bước morphology.
+        row_tolerance: Dung sai gom nhóm theo hàng.
+        size_tolerance_ratio: Dung sai đồng đều kích thước trong một nhóm.
+        min_boxes_per_group: Số box tối thiểu để coi là một nhóm hợp lệ.
+
+    Returns:
+        Dictionary gồm `part_i`, `part_ii`, `part_iii`, và `all_parts`.
     """
     if not boxes:
         return {"part_i": [], "part_ii": [], "part_iii": [], "all_parts": []}
 
     def _bbox_iou(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
+        # Hàm hỗ trợ một bước xử lý trong pipeline chấm phiếu.
         ax, ay, aw, ah = a
         bx, by, bw, bh = b
         x1 = max(ax, bx)
@@ -1249,6 +1925,7 @@ def group_boxes_into_parts(
         return float(inter) / float(union) if union > 0 else 0.0
 
     def _rect_to_poly(x: int, y: int, w: int, h: int) -> np.ndarray:
+        # Hàm phụ chuyển đổi biểu diễn hình học giữa các dạng.
         return np.array(
             [
                 [[x, y]],
@@ -1260,6 +1937,7 @@ def group_boxes_into_parts(
         )
 
     def _is_uniform_size(group: List[Dict[str, object]], tol: float) -> bool:
+        # Hàm hỗ trợ một bước xử lý trong pipeline chấm phiếu.
         areas = [int(b["area"]) for b in group]
         if not areas:
             return False
@@ -1270,6 +1948,7 @@ def group_boxes_into_parts(
         return max_rel <= tol
 
     def _select_best_subset(group: List[Dict[str, object]], expected_count: int) -> List[Dict[str, object]]:
+        # Hàm hỗ trợ một bước xử lý trong pipeline chấm phiếu.
         if len(group) < expected_count:
             return []
         sorted_group = sorted(group, key=lambda b: int(b["x"]))
@@ -1363,6 +2042,7 @@ def group_boxes_into_parts(
     estimated_page_height = max(int(b["y"]) + int(b["h"]) for b in deduped)
 
     def _group_center_ratio(group: List[Dict[str, object]]) -> float:
+        # Hàm phụ gom nhóm dữ liệu theo quy tắc hình học.
         cy = float(np.mean([int(b["center_y"]) for b in group]))
         return (cy / float(estimated_page_height)) if estimated_page_height > 0 else 0.0
 
@@ -1808,6 +2488,19 @@ def group_boxes_into_parts(
 
 
 def _rect_to_poly(x: int, y: int, w: int, h: int) -> np.ndarray:
+    # Hàm phụ chuyển đổi biểu diễn hình học giữa các dạng.
+    """
+    Chuyển bounding rectangle sang contour polygon 4 đỉnh.
+
+    Args:
+        x: Tọa độ trái.
+        y: Tọa độ trên.
+        w: Chiều rộng.
+        h: Chiều cao.
+
+    Returns:
+        Contour đa giác hình chữ nhật dạng OpenCV.
+    """
     return np.array(
         [
             [[x, y]],
@@ -1820,6 +2513,16 @@ def _rect_to_poly(x: int, y: int, w: int, h: int) -> np.ndarray:
 
 
 def _build_box_info(boxes: List[np.ndarray]) -> List[Dict[str, object]]:
+    # Hàm phụ dựng cấu trúc dữ liệu trung gian dùng lại nhiều nơi.
+    """
+    Dựng metadata cơ bản cho từng box để thuận tiện cho các bước gom nhóm.
+
+    Args:
+        boxes: Danh sách contour box.
+
+    Returns:
+        Danh sách dictionary chứa vị trí, kích thước, tâm Y và diện tích mỗi box.
+    """
     box_info: List[Dict[str, object]] = []
     for box in boxes:
         x, y, w, h = cv2.boundingRect(box)
@@ -1841,6 +2544,17 @@ def _group_box_info_by_row(
     box_info: List[Dict[str, object]],
     row_tolerance: int,
 ) -> List[List[Dict[str, object]]]:
+    # Hàm phụ gom nhóm dữ liệu theo quy tắc hình học.
+    """
+    Gom danh sách box-info thành các hàng dựa trên độ gần nhau theo trục Y.
+
+    Args:
+        box_info: Danh sách metadata box.
+        row_tolerance: Ngưỡng lệch theo Y để coi cùng một hàng.
+
+    Returns:
+        Danh sách nhóm hàng, mỗi phần tử là một list box-info.
+    """
     sorted_info = sorted(box_info, key=lambda b: b["center_y"])
     groups: List[List[Dict[str, object]]] = []
     for box in sorted_info:
@@ -1859,6 +2573,17 @@ def _group_box_info_by_row(
 
 
 def _is_uniform_size_group(group: List[Dict[str, object]], size_tolerance_ratio: float) -> bool:
+    # Hàm hỗ trợ một bước xử lý trong pipeline chấm phiếu.
+    """
+    Kiểm tra một nhóm box có đồng đều kích thước theo diện tích hay không.
+
+    Args:
+        group: Nhóm box-info cần kiểm tra.
+        size_tolerance_ratio: Ngưỡng lệch tương đối tối đa cho phép.
+
+    Returns:
+        `True` nếu nhóm có độ đồng đều đạt yêu cầu.
+    """
     areas = [b["area"] for b in group]
     mean_area = np.mean(areas)
     return max([abs(a - mean_area) / mean_area for a in areas]) <= size_tolerance_ratio if mean_area > 0 else True
@@ -1869,6 +2594,18 @@ def _filter_rows_by_global_size_consistency(
     size_tolerance_ratio: float,
     debug: bool = False,
 ) -> List[List[np.ndarray]]:
+    # Hàm phụ lọc nhiễu hoặc loại bỏ phần tử không đạt điều kiện.
+    """
+    Lọc các hàng có kích thước trung bình lệch quá xa so với mặt bằng chung.
+
+    Args:
+        rows: Danh sách hàng box.
+        size_tolerance_ratio: Ngưỡng lệch tương đối cho phép.
+        debug: Bật log chi tiết khi lọc.
+
+    Returns:
+        Danh sách hàng sau lọc nhiễu kích thước.
+    """
     if not rows:
         return rows
 
@@ -1909,6 +2646,17 @@ def _trim_rows_to_consistent_window(
     rows: List[List[np.ndarray]],
     max_rows: int,
 ) -> List[List[np.ndarray]]:
+    # Hàm phụ cắt/chọn cửa sổ dữ liệu ổn định nhất.
+    """
+    Chọn cửa sổ liên tiếp có hình học ổn định nhất khi số hàng vượt giới hạn.
+
+    Args:
+        rows: Danh sách hàng box đầu vào.
+        max_rows: Số hàng tối đa cần giữ.
+
+    Returns:
+        Danh sách hàng đã được cắt về cửa sổ ổn định nhất.
+    """
     if len(rows) <= max_rows:
         return rows
 
@@ -1958,19 +2706,29 @@ def detect_sobao_danh_boxes(
     size_tolerance_ratio: float = 0.3,
     debug: bool = False,
 ) -> Dict[str, object]:
+    # Phát hiện dữ liệu/đối tượng theo tiêu chí của bước này.
     """
-    Detect and group SoBaoDanh (roll number) boxes.
-    
-    SoBaoDanh typically has:
-    - 6 boxes per row
-    - Up to 10 consecutive rows
-    - Uniform box sizes within each row (relaxed tolerance for various document qualities)
-    
+    Phát hiện và gom nhóm các box của vùng Số báo danh.
+
+    Đặc trưng vùng SoBaoDanh:
+    - Mỗi hàng có 6 box.
+    - Tối đa 10 hàng liên tiếp.
+    - Kích thước box trong cùng một hàng tương đối đồng đều
+      (cho phép dung sai để chịu được ảnh scan chất lượng khác nhau).
+
+    Args:
+        boxes: Danh sách box ứng viên vùng Số báo danh.
+        boxes_per_row: Số box kỳ vọng trên mỗi hàng.
+        max_rows: Số hàng tối đa cần giữ.
+        row_tolerance: Dung sai gom nhóm theo trục Y.
+        size_tolerance_ratio: Dung sai đồng đều kích thước trong hàng.
+        debug: Bật/tắt log debug.
+
     Returns:
-        Dictionary with:
-        - 'sobao_danh': List of all detected SoBaoDanh boxes
-        - 'sobao_danh_rows': List of rows, each row containing 6 boxes
-        - 'row_count': Number of detected rows
+        Dictionary gồm:
+        - 'sobao_danh': Danh sách toàn bộ box SoBaoDanh đã phát hiện.
+        - 'sobao_danh_rows': Danh sách các hàng, mỗi hàng chứa 6 box.
+        - 'row_count': Số hàng đã phát hiện.
     """
     if not boxes:
         return {
@@ -1991,9 +2749,11 @@ def detect_sobao_danh_boxes(
     
     # Helper function to check size uniformity
     def is_uniform_size(group: List[Dict[str, object]]) -> bool:
+        # Hàm hỗ trợ một bước xử lý trong pipeline chấm phiếu.
         return _is_uniform_size_group(group, size_tolerance_ratio)
 
     def _try_recover_merged_row(group: List[Dict[str, object]]) -> Optional[List[np.ndarray]]:
+        # Hàm hỗ trợ một bước xử lý trong pipeline chấm phiếu.
         # Recovery for rows where one merged contour combines two adjacent bubbles
         # and the row appears as 5 boxes instead of 6.
         if len(group) != boxes_per_row - 1:
@@ -2157,6 +2917,7 @@ def detect_sobao_danh_boxes(
                         row_h = max(1, int(round(float(np.median(h_list)))))
 
                         def rect_to_poly(x: int, y: int, w: int, h: int) -> np.ndarray:
+                            # Hàm hỗ trợ một bước xử lý trong pipeline chấm phiếu.
                             return np.array(
                                 [
                                     [[x, y]],
@@ -2218,6 +2979,74 @@ def detect_sobao_danh_boxes(
                             sobao_danh = [box for row in sobao_danh_rows for box in row]
                             if debug:
                                 print("  • Dropped top outlier SBD row (no suitable len-5 replacement)")
+
+    # Normalize malformed top row where one or more boxes are abnormally wide/shifted.
+    # This appears on some scans (e.g. 0003) where first-row middle boxes merge visually.
+    if len(sobao_danh_rows) >= 2:
+        row_with_y = []
+        for row in sobao_danh_rows:
+            ys = [cv2.boundingRect(box)[1] for box in row]
+            row_with_y.append((float(np.mean(ys)) if ys else 0.0, row))
+        row_with_y.sort(key=lambda t: t[0])
+
+        top_row = row_with_y[0][1]
+        ref_rows = [r for _, r in row_with_y[1:] if len(r) == boxes_per_row]
+
+        if len(top_row) == boxes_per_row and ref_rows:
+            top_rects = sorted([cv2.boundingRect(b) for b in top_row], key=lambda r: r[0])
+
+            col_x_lists: List[List[int]] = [[] for _ in range(boxes_per_row)]
+            col_w_lists: List[List[int]] = [[] for _ in range(boxes_per_row)]
+            h_list: List[int] = []
+
+            for row in ref_rows:
+                rects = sorted([cv2.boundingRect(b) for b in row], key=lambda r: r[0])
+                if len(rects) != boxes_per_row:
+                    continue
+                for c, (rx, ry, rw, rh) in enumerate(rects):
+                    col_x_lists[c].append(int(rx))
+                    col_w_lists[c].append(int(rw))
+                    h_list.append(int(rh))
+
+            if all(col_x_lists[c] for c in range(boxes_per_row)) and h_list:
+                col_x = [int(round(float(np.median(col_x_lists[c])))) for c in range(boxes_per_row)]
+                col_w = [max(1, int(round(float(np.median(col_w_lists[c]))))) for c in range(boxes_per_row)]
+                row_h = max(1, int(round(float(np.median(h_list)))))
+
+                wide_outliers = 0
+                shifted_outliers = 0
+                overlap_count = 0
+                for c, (rx, ry, rw, rh) in enumerate(top_rects):
+                    width_tol_hi = col_w[c] * 1.35
+                    width_tol_lo = col_w[c] * 0.65
+                    if rw > width_tol_hi or rw < width_tol_lo:
+                        wide_outliers += 1
+
+                    shift_tol = max(6.0, col_w[c] * 0.35)
+                    if abs(rx - col_x[c]) > shift_tol:
+                        shifted_outliers += 1
+
+                for c in range(boxes_per_row - 1):
+                    x0, y0, w0, h0 = top_rects[c]
+                    x1, y1, w1, h1 = top_rects[c + 1]
+                    if x0 + w0 > x1:
+                        overlap_count += 1
+
+                top_row_is_malformed = (wide_outliers >= 1 and shifted_outliers >= 1) or overlap_count >= 1
+                if top_row_is_malformed:
+                    row_y = int(round(float(np.mean([r[1] for r in top_rects]))))
+                    normalized_top = [
+                        _rect_to_poly(col_x[c], row_y, col_w[c], row_h)
+                        for c in range(boxes_per_row)
+                    ]
+                    row_with_y[0] = (row_with_y[0][0], normalized_top)
+                    sobao_danh_rows = [row for _, row in row_with_y]
+                    sobao_danh = [box for row in sobao_danh_rows for box in row]
+                    if debug:
+                        print(
+                            "  ✓ Normalized top SBD row geometry "
+                            f"(wide={wide_outliers}, shifted={shifted_outliers}, overlap={overlap_count})"
+                        )
     
     return {
         "sobao_danh": sobao_danh,
@@ -2234,19 +3063,28 @@ def detect_ma_de_boxes(
     size_tolerance_ratio: float = 0.3,
     debug: bool = False,
 ) -> Dict[str, object]:
+    # Phát hiện dữ liệu/đối tượng theo tiêu chí của bước này.
     """
-    Detect and group MaDe (code/exam ID) boxes.
-    
-    MaDe typically has:
-    - 3 boxes per row
-    - Up to 10 rows max
-    - Uniform box sizes within each row
-    
+    Phát hiện và gom nhóm các box của vùng Mã đề.
+
+    Đặc trưng vùng Mã đề:
+    - Mỗi hàng có 3 box.
+    - Tối đa 10 hàng.
+    - Kích thước box trong cùng hàng tương đối đồng đều.
+
+    Args:
+        boxes: Danh sách box ứng viên vùng Mã đề.
+        boxes_per_row: Số box kỳ vọng trên mỗi hàng.
+        max_rows: Số hàng tối đa cần giữ.
+        row_tolerance: Dung sai gom nhóm theo trục Y.
+        size_tolerance_ratio: Dung sai đồng đều kích thước trong hàng.
+        debug: Bật/tắt log debug.
+
     Returns:
-        Dictionary with:
-        - 'ma_de': List of all detected MaDe boxes
-        - 'ma_de_rows': List of rows, each row containing 3 boxes
-        - 'row_count': Number of detected rows
+        Dictionary gồm:
+        - 'ma_de': Danh sách toàn bộ box Mã đề đã phát hiện.
+        - 'ma_de_rows': Danh sách các hàng, mỗi hàng chứa 3 box.
+        - 'row_count': Số hàng đã phát hiện.
     """
     if not boxes:
         return {
@@ -2267,6 +3105,7 @@ def detect_ma_de_boxes(
     
     # Helper function to check size uniformity
     def is_uniform_size(group: List[Dict[str, object]]) -> bool:
+        # Hàm hỗ trợ một bước xử lý trong pipeline chấm phiếu.
         return _is_uniform_size_group(group, size_tolerance_ratio)
     
     # Find all rows with exactly boxes_per_row (3) boxes
@@ -2341,14 +3180,33 @@ def detect_boxes_from_morph_lines(
     close_kernel_size: int = 6,
     debug_prefix: Optional[str] = None,
 ) -> Dict[str, object]:
+    # Phát hiện dữ liệu/đối tượng theo tiêu chí của bước này.
     """
-    Detect enclosed boxes formed by morphology-detected horizontal/vertical lines.
+    Phát hiện các ô kín tạo bởi mạng đường dọc/ngang từ morphology.
 
-    Steps:
-    1. Detect vertical/horizontal line masks.
-    2. Merge line masks and close small gaps on line network.
-    3. Flood-fill the outer background to isolate enclosed regions.
-    4. Connected components on enclosed regions -> cell interior boxes.
+    Các bước chính:
+    1. Tách mask đường dọc/ngang.
+    2. Ghép line mask và đóng các khe hở nhỏ.
+    3. Flood-fill nền ngoài để tách vùng kín bên trong.
+    4. Tách connected components để lấy contour ô.
+
+    Args:
+        image: Ảnh đầu vào.
+        vertical_scale: Tỉ lệ chiều dài kernel dọc.
+        horizontal_scale: Tỉ lệ chiều dài kernel ngang.
+        min_line_length: Ngưỡng độ dài tối thiểu của line thành phần.
+        align_vertical_rows: Bật căn chỉnh độ dài line dọc theo hàng.
+        vertical_row_tolerance: Dung sai gom line dọc theo hàng.
+        block_size: Kích thước block của adaptive threshold.
+        block_offset: Hệ số C của adaptive threshold.
+        min_box_area: Diện tích tối thiểu để giữ contour box.
+        min_box_width: Chiều rộng tối thiểu của box.
+        min_box_height: Chiều cao tối thiểu của box.
+        close_kernel_size: Kích thước kernel đóng khe hở line.
+        debug_prefix: Tiền tố lưu ảnh debug trung gian.
+
+    Returns:
+        Dictionary chứa ảnh trung gian, overlay và danh sách contour box phát hiện.
     """
     grid = detect_grid_points(
         image=image,
@@ -2363,11 +3221,11 @@ def detect_boxes_from_morph_lines(
     vertical = grid["vertical"]
     horizontal = grid["horizontal"]
 
-    # Only line segments >= min_line_length are allowed to form boxes.
+    # Chỉ giữ các đoạn line đủ dài để tránh sinh box từ nhiễu ngắn.
     vertical = _filter_line_components_by_length(vertical, min_line_length, "vertical")
     horizontal = _filter_line_components_by_length(horizontal, min_line_length, "horizontal")
 
-    # Align parallel vertical lines in same row to identical start/end positions.
+    # Căn lại các line dọc song song trong cùng hàng để biên trên/dưới đồng đều hơn.
     if align_vertical_rows:
         vertical = _align_vertical_lengths_by_row(
             vertical,
@@ -2389,21 +3247,21 @@ def detect_boxes_from_morph_lines(
 
     enclosed = np.where(flood == 255, 255, 0).astype(np.uint8)
 
-    # Extract contours (actual polygon shapes) instead of axis-aligned rectangles
+    # Lấy contour đa giác thật thay vì chỉ dùng bounding box chữ nhật trục chuẩn.
     contours, _ = cv2.findContours(enclosed, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
-    boxes: List[np.ndarray] = []  # Store contour polygons instead of (x,y,w,h)
+    boxes: List[np.ndarray] = []  # Lưu polygon contour để giữ đúng hình học phối cảnh.
     for contour in contours:
         area = cv2.contourArea(contour)
         
         if area < min_box_area:
             continue
         
-        # Approximate contour to a polygon with tighter epsilon for more vertices
+        # Xấp xỉ contour thành polygon với epsilon nhỏ để giữ biên dạng tốt hơn.
         epsilon = 0.005 * cv2.arcLength(contour, True)
         approx = cv2.approxPolyDP(contour, epsilon, True)
         
-        # Get bounding box for size filtering
+        # Dùng boundingRect để lọc nhanh các contour quá nhỏ.
         x, y, bw, bh = cv2.boundingRect(approx)
         
         if bw < min_box_width or bh < min_box_height:
@@ -2411,7 +3269,7 @@ def detect_boxes_from_morph_lines(
 
         boxes.append(approx)
 
-    # Sort boxes by first vertex position
+    # Sắp theo vị trí để đầu ra ổn định giữa các lần chạy.
     boxes.sort(key=lambda b: (int(b[0, 0, 1]), int(b[0, 0, 0])))
 
     overlay = image.copy() if image.ndim == 3 else cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
@@ -2419,6 +3277,7 @@ def detect_boxes_from_morph_lines(
         cv2.polylines(overlay, [poly], True, (0, 255, 0), 2)
 
     result = {
+        "binary": grid["binary"],
         "vertical": vertical,
         "horizontal": horizontal,
         "lines": lines,
@@ -2444,19 +3303,20 @@ def extrapolate_missing_rows(
     target_rows: int = 10,
     debug: bool = False,
 ) -> Dict[str, object]:
+    # Nội suy/ngoại suy dữ liệu thiếu dựa trên mốc tham chiếu.
     """
-    Extrapolate missing rows for SoBaoDanh and MaDe based on row spacing.
-    
-    Assumes all rows (SoBaoDanh and MaDe) are vertically aligned and
-    should be evenly spaced. Fills in missing rows to reach target_rows count.
-    
+    Nội suy/ngoại suy các hàng còn thiếu cho SoBaoDanh và Mã đề dựa trên khoảng cách hàng.
+
+    Giả định các hàng của hai vùng được căn thẳng theo trục dọc và có khoảng cách gần đều.
+    Hàm sẽ điền các hàng còn thiếu để đạt đủ `target_rows`.
+
     Args:
-        detection_results: Dictionary with 'sobao_danh_rows' and 'ma_de_rows'
-        target_rows: Target number of rows (default 10)
-        debug: Print debug information
-    
+        detection_results: Dictionary chứa 'sobao_danh_rows' và 'ma_de_rows'.
+        target_rows: Số hàng mục tiêu (mặc định 10).
+        debug: Bật in thông tin debug khi xử lý.
+
     Returns:
-        Updated detection_results with extrapolated rows
+        Dictionary kết quả đã bổ sung các hàng nội suy/ngoại suy.
     """
     sobao_danh_rows = detection_results.get("sobao_danh_rows", [])
     ma_de_rows = detection_results.get("ma_de_rows", [])
@@ -2519,7 +3379,8 @@ def extrapolate_missing_rows(
     
     # Map detected MaDe rows to SoBaoDanh Y positions
     def align_rows_to_reference_positions(detected_rows, detected_y_positions, reference_positions, name="", tolerance=20):
-        """Align detected rows to reference positions (SoBaoDanh Y positions)."""
+        # Hàm hỗ trợ một bước xử lý trong pipeline chấm phiếu.
+        """Căn các hàng phát hiện được vào các vị trí tham chiếu theo trục Y."""
         aligned = [None] * len(reference_positions)
         
         for row_idx, (row, y_pos) in enumerate(zip(detected_rows, detected_y_positions)):
@@ -2580,7 +3441,16 @@ def extrapolate_missing_rows(
 
 
 def _normalize_image_stem(image_arg: Optional[str]) -> str:
-    """Normalize user-provided image argument to stem format: PhieuQG.XXXX."""
+    # Chuẩn hóa đầu vào về định dạng ổn định trước khi xử lý.
+    """
+    Chuẩn hóa tham số ảnh người dùng nhập về dạng `PhieuQG.XXXX`.
+
+    Args:
+        image_arg: Chuỗi người dùng nhập (id, tên file, hoặc đường dẫn).
+
+    Returns:
+        Tên stem chuẩn hóa để dùng thống nhất trong pipeline.
+    """
     if not image_arg:
         return "PhieuQG.0015"
 
@@ -2606,7 +3476,102 @@ def _normalize_image_stem(image_arg: Optional[str]) -> str:
     return f"PhieuQG.{suffix}"
 
 
+def _draw_rows_contours(
+    image: np.ndarray,
+    rows: List[List[np.ndarray]],
+    color: Tuple[int, int, int],
+    thickness: int,
+) -> int:
+    # Hàm hỗ trợ vẽ hình học/phần tử phụ trợ trong pipeline.
+    """
+    Vẽ contour cho danh sách hàng box và trả về số box đã vẽ.
+
+    Args:
+        image: Ảnh cần vẽ.
+        rows: Danh sách hàng box.
+        color: Màu vẽ contour.
+        thickness: Độ dày nét vẽ.
+
+    Returns:
+        Tổng số box đã được vẽ lên ảnh.
+    """
+    drawn = 0
+    for row in rows:
+        for poly in row:
+            cv2.polylines(image, [poly], True, color, thickness)
+            drawn += 1
+    return drawn
+
+
+def _print_grid_info(
+    grid_info: List[Dict[str, object]],
+    detail_formatter: Optional[Callable[[Dict[str, object]], str]] = None,
+) -> None:
+    # In tóm tắt nhanh để theo dõi chất lượng xử lý khi chạy.
+    """
+    In thông tin grid theo định dạng thống nhất cho log debug.
+
+    Args:
+        grid_info: Danh sách metadata lưới.
+        detail_formatter: Hàm tùy chọn để format thêm thông tin theo từng box.
+
+    Returns:
+        Không trả về giá trị.
+    """
+    print(f"Grid drawn on {len(grid_info)} boxes")
+    for info in grid_info:
+        detail = detail_formatter(info) if detail_formatter is not None else ""
+        suffix = f", {detail}" if detail else ""
+        print(
+            f"  Box {info['box_idx']}: region {info['region_size']}, "
+            f"cell_size ~{info['cell_size'][0]:.1f}x{info['cell_size'][1]:.1f}{suffix}"
+        )
+
+
+def _evaluate_section_fill(
+    section_name: str,
+    binary_threshold: Optional[np.ndarray],
+    grid_info: List[Dict[str, object]],
+    fill_ratio_thresh: float,
+    inner_margin_ratio: float,
+    circle_radius_scale: float,
+    circle_border_exclude_ratio: float,
+) -> List[Dict[str, object]]:
+    # Hàm hỗ trợ một bước xử lý trong pipeline chấm phiếu.
+    """
+    Đánh giá ô tô đậm cho một section với cấu hình mask vòng tròn thống nhất.
+
+    Args:
+        section_name: Tên section dùng cho log.
+        binary_threshold: Ảnh nhị phân đầu vào.
+        grid_info: Metadata lưới của section.
+        fill_ratio_thresh: Ngưỡng phân loại tô/không tô.
+        inner_margin_ratio: Tỉ lệ co vùng chấm bên trong mỗi ô.
+        circle_radius_scale: Hệ số bán kính bubble.
+        circle_border_exclude_ratio: Tỉ lệ bỏ viền ngoài bubble.
+
+    Returns:
+        Danh sách kết quả chấm cho section.
+    """
+    if binary_threshold is None or not grid_info:
+        return []
+
+    evals = evaluate_grid_fill_from_binary(
+        binary_image=binary_threshold,
+        grid_info=grid_info,
+        fill_ratio_thresh=fill_ratio_thresh,
+        inner_margin_ratio=inner_margin_ratio,
+        mask_mode="hough-circle",
+        circle_radius_scale=circle_radius_scale,
+        circle_border_exclude_ratio=circle_border_exclude_ratio,
+    )
+    _print_fill_summary(section_name, evals)
+    return evals
+
+
 def _demo(image_arg: Optional[str] = None) -> None:
+    # Pipeline demo đầy đủ: detect, chấm, vẽ và xuất debug.
+    # Chuẩn hóa tên ảnh đầu vào để hỗ trợ nhiều kiểu tham số (0015, PhieuQG.0015, ...).
     base_image_name = _normalize_image_stem(image_arg)
     candidate_paths = [
         Path("PhieuQG") / f"{base_image_name}.jpg",
@@ -2622,10 +3587,9 @@ def _demo(image_arg: Optional[str] = None) -> None:
         tried = ", ".join(str(p) for p in candidate_paths)
         raise FileNotFoundError(f"Cannot read image. Tried: {tried}")
 
-    # Keep a pristine image for horizontal-binary fill visualization.
-    original_image = img.copy()
-
     def _run_detection_pipeline(src_img: np.ndarray, prefix: Optional[str]) -> Tuple[Dict[str, object], Dict[str, object]]:
+        # Hàm hỗ trợ một bước xử lý trong pipeline chấm phiếu.
+        # Pipeline phát hiện box + gom phần I/II/III.
         data_local = detect_boxes_from_morph_lines(
             src_img,
             vertical_scale=0.015,
@@ -2645,6 +3609,8 @@ def _demo(image_arg: Optional[str] = None) -> None:
         return data_local, parts_local
 
     def _preprocess_clahe(src_img: np.ndarray) -> np.ndarray:
+        # Hàm hỗ trợ một bước xử lý trong pipeline chấm phiếu.
+        # Tăng tương phản cục bộ để cứu các scan mờ/thiếu nét.
         lab = cv2.cvtColor(src_img, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -2652,6 +3618,8 @@ def _demo(image_arg: Optional[str] = None) -> None:
         return cv2.cvtColor(cv2.merge([l2, a, b]), cv2.COLOR_LAB2BGR)
 
     def _parts_score(parts_local: Dict[str, object], page_h: int) -> float:
+        # Hàm hỗ trợ một bước xử lý trong pipeline chấm phiếu.
+        # Điểm heuristic để chọn kết quả detect tốt hơn giữa base và CLAHE.
         p1 = len(parts_local["part_i"])
         p2 = len(parts_local["part_ii"])
         p3 = len(parts_local["part_iii"])
@@ -2660,7 +3628,7 @@ def _demo(image_arg: Optional[str] = None) -> None:
         score += 4.0 * min(1.0, p2 / 8.0)
         score += 3.0 * min(1.0, p3 / 6.0)
 
-        # Favor Part III located in lower page region.
+        # Ưu tiên cấu hình có Part III nằm ở vùng thấp của trang (đúng bố cục phiếu).
         if p3 and page_h > 0:
             y_vals = [cv2.boundingRect(b)[1] for b in parts_local["part_iii"]]
             p3_ratio = float(np.mean(y_vals)) / float(page_h)
@@ -2673,7 +3641,7 @@ def _demo(image_arg: Optional[str] = None) -> None:
     preprocess_mode = "base"
     page_h = img.shape[0] if img is not None else 0
 
-    # Fallback for difficult scans: enhance contrast and re-detect.
+    # Fallback cho ảnh khó: thử CLAHE rồi chọn kết quả có điểm bố cục tốt hơn.
     if len(parts["part_ii"]) < 8 or len(parts["part_iii"]) < 6:
         img_clahe = _preprocess_clahe(img)
         data_clahe, parts_clahe = _run_detection_pipeline(img_clahe, None)
@@ -2688,25 +3656,23 @@ def _demo(image_arg: Optional[str] = None) -> None:
     print(f"Detected boxes: {len(data['boxes'])}")
     print(f"Preprocess mode: {preprocess_mode}")
     
-    # Group boxes into parts
+    # In thống kê số box từng phần để theo dõi chất lượng detect.
     print(f"Part I boxes: {len(parts['part_i'])}")
     print(f"Part II boxes: {len(parts['part_ii'])}")
     print(f"Part III boxes: {len(parts['part_iii'])}")
     
-    # Detect SoBaoDanh boxes (remaining boxes after parts)
-    # Track indices of boxes that are part of the parts
+    # Lấy các box còn lại sau khi đã tách Part I/II/III để tìm vùng SBD/Mã đề.
     part_box_set = set(id(box) for box in parts["all_parts"])
     remaining_boxes = [box for box in data["boxes"] if id(box) not in part_box_set]
 
-    # Some scans merge adjacent bubbles into one wide box (e.g. 2 bubbles fused).
-    # Split these before separating/grouping upper ID region.
+    # Một số scan dính 2 bubble thành 1 contour rộng, cần tách trước khi nhóm.
     remaining_for_upper = _split_merged_boxes_for_grouping(
         remaining_boxes,
         split_wide=True,
         split_tall=False,
     )
 
-    # Separate upper ID region into SoBaoDanh (left) and MaDe (right) by X split.
+    # Tách vùng ID phía trên thành SBD bên trái và Mã đề bên phải theo trục X.
     sbd_candidates, ma_de_candidates, split_x = _separate_upper_id_boxes(
         remaining_for_upper,
         parts["part_i"],
@@ -2723,10 +3689,7 @@ def _demo(image_arg: Optional[str] = None) -> None:
     print(f"SoBaoDanh rows: {sobao_danh['row_count']}")
     print(f"SoBaoDanh boxes: {len(sobao_danh['sobao_danh'])}")
     
-    # Detect MaDe boxes (remaining boxes after parts and SoBaoDanh)
-    # Track indices of boxes that are part of parts and SoBaoDanh
-    # Some scans merge two consecutive MaDe rows vertically into a tall box.
-    # Split these before grouping MaDe rows.
+    # Với Mã đề, có trường hợp dính 2 hàng theo chiều dọc thành box cao -> tách trước.
     remaining_for_ma_de = _split_merged_boxes_for_grouping(
         ma_de_candidates,
         split_wide=False,
@@ -2741,13 +3704,14 @@ def _demo(image_arg: Optional[str] = None) -> None:
         debug=False,
     )
 
-    # Complete MaDe to 10 rows using SoBaoDanh Y references when some rows are missing.
+    # Bù thiếu MaDe lên đủ 10 hàng bằng cách neo theo trục Y của SoBaoDanh.
+    # Ý tưởng: dùng hình học cột MaDe đã phát hiện tốt để nội suy những hàng bị mất.
     if ma_de["row_count"] < 10 and ma_de["ma_de_rows"] and sobao_danh["sobao_danh_rows"]:
-        ref_positions = []
-        for row in sobao_danh["sobao_danh_rows"][:10]:
-            ys = [cv2.boundingRect(box)[1] for box in row]
-            if ys:
-                ref_positions.append(int(round(float(np.mean(ys)))))
+        ref_positions = [
+            int(round(float(np.mean([cv2.boundingRect(box)[1] for box in row]))))
+            for row in sobao_danh["sobao_danh_rows"][:10]
+            if row
+        ]
 
         ma_de_rect_rows = []
         for row in ma_de["ma_de_rows"]:
@@ -2757,7 +3721,7 @@ def _demo(image_arg: Optional[str] = None) -> None:
                 ma_de_rect_rows.append(rects)
 
         if len(ref_positions) == 10 and ma_de_rect_rows:
-            # Build a stable geometry template for 3 MaDe columns.
+            # Dựng template hình học ổn định cho 3 cột Mã đề.
             col_x = [int(round(float(np.median([rects[c][0] for rects in ma_de_rect_rows])))) for c in range(3)]
             col_w = [int(round(float(np.median([rects[c][2] for rects in ma_de_rect_rows])))) for c in range(3)]
             row_h = int(round(float(np.median([rects[0][3] for rects in ma_de_rect_rows]))))
@@ -2783,23 +3747,11 @@ def _demo(image_arg: Optional[str] = None) -> None:
                 if chosen_idx is None:
                     continue
 
-                row_polys: List[np.ndarray] = []
-                for rx, ry, rw, rh in rects:
-                    row_polys.append(
-                        np.array(
-                            [
-                                [[rx, ry]],
-                                [[rx + rw, ry]],
-                                [[rx + rw, ry + rh]],
-                                [[rx, ry + rh]],
-                            ],
-                            dtype=np.int32,
-                        )
-                    )
+                row_polys = [_rect_to_poly(rx, ry, rw, rh) for rx, ry, rw, rh in rects]
                 aligned_rows[chosen_idx] = row_polys
                 used_ref_indices.add(chosen_idx)
 
-            # Fill missing rows with synthetic boxes at the reference Y.
+            # Nội suy các hàng còn thiếu bằng box tổng hợp tại các mốc Y tham chiếu.
             for idx in range(10):
                 if aligned_rows[idx] is not None:
                     continue
@@ -2808,17 +3760,7 @@ def _demo(image_arg: Optional[str] = None) -> None:
                 for c in range(3):
                     x = col_x[c]
                     w = max(1, col_w[c])
-                    synthetic_row.append(
-                        np.array(
-                            [
-                                [[x, y_ref]],
-                                [[x + w, y_ref]],
-                                [[x + w, y_ref + row_h]],
-                                [[x, y_ref + row_h]],
-                            ],
-                            dtype=np.int32,
-                        )
-                    )
+                    synthetic_row.append(_rect_to_poly(x, y_ref, w, row_h))
                 aligned_rows[idx] = synthetic_row
 
             ma_de_completed_rows = [row for row in aligned_rows if row is not None]
@@ -2831,7 +3773,7 @@ def _demo(image_arg: Optional[str] = None) -> None:
     print(f"MaDe boxes: {len(ma_de['ma_de'])}")
     print(f"Upper split X: {split_x:.1f}")
     
-    # Extrapolate missing rows to reach 10 rows for both sections
+    # Căn thẳng theo trục Y và ngoại suy để cả SBD/Mã đề đều đủ 10 hàng logic.
     combined_results = {
         "sobao_danh_rows": sobao_danh["sobao_danh_rows"],
         "ma_de_rows": ma_de["ma_de_rows"]
@@ -2842,8 +3784,7 @@ def _demo(image_arg: Optional[str] = None) -> None:
     print(f"  SoBaoDanh: {extrapolated['sobao_detected_count']}/10 detected, {extrapolated['sobao_missing_count']} missing")
     print(f"  MaDe: {extrapolated['ma_de_detected_count']}/10 detected, {extrapolated['ma_de_missing_count']} missing")
     
-    # Show missing row positions
-    aligned_sobao = extrapolated.get("sobao_danh_rows_aligned", [])
+    # In vị trí các hàng Mã đề còn thiếu để tiện debug theo Y.
     aligned_ma_de = extrapolated.get("ma_de_rows_aligned", [])
     reference_positions = extrapolated.get("reference_positions", [])
     
@@ -2854,12 +3795,32 @@ def _demo(image_arg: Optional[str] = None) -> None:
                 y_pos = reference_positions[idx] if idx < len(reference_positions) else "?"
                 print(f"    Row {idx + 1}: Y ≈ {y_pos}")
     
-    # Draw parts on overlay with different colors and labels
+    gray_for_digits = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    sobao_rows_aligned = extrapolated.get("sobao_danh_rows_aligned", sobao_danh["sobao_danh_rows"])
+    ma_de_rows_aligned = extrapolated.get("ma_de_rows_aligned", ma_de["ma_de_rows"])
+
+    sbd_digits = evaluate_digit_rows_mean_darkness(
+        gray_for_digits,
+        sobao_rows_aligned,
+        expected_cols=6,
+    )
+    made_digits = evaluate_digit_rows_mean_darkness(
+        gray_for_digits,
+        ma_de_rows_aligned,
+        expected_cols=3,
+    )
+
+    print("\n=== Mean-Darkness Digit Decode ===")
+    _print_digit_darkness_summary("SoBaoDanh", sbd_digits)
+    _print_digit_darkness_summary("MaDe", made_digits)
+
+    # Vẽ viền Part I/II/III bằng màu khác nhau để kiểm tra tách phần.
     overlay = img.copy()
     font = cv2.FONT_HERSHEY_SIMPLEX
     font_scale, font_thickness = 1.5, 2
     
-    # Part configurations: (part_key, label, color)
+    # Cấu hình màu và nhãn cho từng phần.
     part_configs = [
         ("part_i", "Part I (4)", (0, 255, 0)),
         ("part_ii", "Part II (8)", (0, 165, 255)),
@@ -2874,34 +3835,28 @@ def _demo(image_arg: Optional[str] = None) -> None:
             min_y = min(cv2.boundingRect(p)[1] for p in parts[part_key])
             cv2.putText(overlay, label, (50, min_y - 20), font, font_scale, color, font_thickness)
     
-    # Draw SoBaoDanh boxes with row labels
-    sobao_color = (255, 128, 0)  # Orange color for SoBaoDanh
-    for row_idx, row in enumerate(sobao_danh["sobao_danh_rows"]):
-        for poly in row:
-            cv2.polylines(overlay, [poly], True, sobao_color, 2)
+    # Vẽ contour cho vùng SBD/Mã đề đã phát hiện thật (không vẽ hàng nội suy ở ảnh parts).
+    sobao_color = (255, 128, 0)  # Màu cam cho SoBaoDanh
+    _draw_rows_contours(overlay, sobao_danh["sobao_danh_rows"], sobao_color, thickness=2)
     
-    # Draw MaDe boxes with row labels
-    ma_de_color = (255, 255, 0)  # Cyan color for MaDe
-    for row_idx, row in enumerate(ma_de["ma_de_rows"]):
-        for poly in row:
-            cv2.polylines(overlay, [poly], True, ma_de_color, 2)
+    ma_de_color = (255, 255, 0)  # Màu cyan cho MaDe
+    _draw_rows_contours(overlay, ma_de["ma_de_rows"], ma_de_color, thickness=2)
     
-    # Do not draw extrapolated placeholders in _parts image;
-    # keep this visualization strictly for detected boxes.
+    # Ở ảnh parts, chỉ hiển thị box phát hiện thật; không hiển thị box nội suy.
     
     cv2.imwrite(f"{debug_prefix}_parts.jpg", overlay)
     print(f"Parts visualization saved to {debug_prefix}_parts.jpg")
-
-    cv2.imwrite(f"{debug_prefix}_original_copy.jpg", original_image)
     
-    # Draw all parts grids on a single image
+    # Vẽ grid toàn bộ phần trắc nghiệm lên cùng một ảnh để debug/đối chiếu nhanh.
     print(f"\n=== Drawing grids on all parts ===")
     combined_grid_image = img.copy()
-    part_i_grid_info: List[Dict[str, object]] = []
-    part_ii_grid_info: List[Dict[str, object]] = []
-    part_iii_grid_info: List[Dict[str, object]] = []
     
-    # Draw 4x10 grid on Part I boxes
+    binary_threshold = data.get("binary")
+    if binary_threshold is not None:
+        print("\nUsing binary threshold image for fill-ratio classification")
+
+    # Phần I: lưới 4x10 chuẩn, ưu tiên giữ sát khung thật để giảm lệch ô.
+    part_i_evals: List[Dict[str, object]] = []
     if parts["part_i"]:
         print(f"\n=== Part I: 4x10 grid (20% x, 10% y) ===")
         grid_result = extract_grid_from_boxes(
@@ -2911,36 +3866,36 @@ def _demo(image_arg: Optional[str] = None) -> None:
             grid_rows=10,
             start_offset_ratio_x=0.2,
             start_offset_ratio_y=0.1,
-            end_offset_ratio_x=0.0,
-            end_offset_ratio_y=0.0,
-            grid_color=(0, 255, 0),  # Green
+            end_offset_ratio_x=0.015,
+            end_offset_ratio_y=0.015,
+            grid_color=(0, 255, 0),  # Màu xanh lá
             grid_thickness=1,
         )
         combined_grid_image = grid_result["image_with_grid"]
-        part_i_grid_info = grid_result["grid_info"]
-        
-        print(f"Grid drawn on {len(grid_result['grid_info'])} boxes")
-        for info in grid_result["grid_info"]:
-            print(f"  Box {info['box_idx']}: region {info['region_size']}, "
-                  f"cell_size ~{info['cell_size'][0]:.1f}x{info['cell_size'][1]:.1f}")
+
+        _print_grid_info(grid_result["grid_info"])
+        part_i_evals = _evaluate_section_fill(
+            section_name="Part I",
+            binary_threshold=binary_threshold,
+            grid_info=grid_result["grid_info"],
+            fill_ratio_thresh=0.54,
+            inner_margin_ratio=0.05,
+            circle_radius_scale=0.6,
+            circle_border_exclude_ratio=0.1,
+        )
     
-    # Draw 2x4 grid on Part II boxes
+    # Phần II: mỗi cụm có offset xen kẽ trái/phải để bám đúng bố cục phiếu.
+    part_ii_evals: List[Dict[str, object]] = []
     if parts["part_ii"]:
         print(f"\n=== Part II: 2x4 grid (alternating offsets, 30% y, -5% bottom) ===")
-        # Part II has 8 boxes, alternating offset pattern:
-        # Box 0, 2, 4, 6 (even index): 20% x, 30% y
-        # Box 1, 3, 5, 7 (odd index): 0% x, 30% y
-        # All boxes: -5% from bottom
-        offset_ratios = []
-        end_offset_x = []
-        end_offset_y = []
-        for box_idx in range(len(parts["part_ii"])):
-            if box_idx % 2 == 0:  # Even index
-                offset_ratios.append((0.3, 0.33))
-            else:  # Odd index
-                offset_ratios.append((0.0, 0.33))
-            end_offset_x.append(0.0)  # 0% from right for all boxes
-            end_offset_y.append(0.03)  # 3% from bottom for all boxes
+        # Part II gồm 8 box, dùng offset xen kẽ để bám đúng vị trí bubble thực tế.
+        part_ii_count = len(parts["part_ii"])
+        offset_ratios = [
+            (0.3, 0.33) if (box_idx % 2 == 0) else (0.0, 0.33)
+            for box_idx in range(part_ii_count)
+        ]
+        end_offset_x = [0.0] * part_ii_count  # 0% từ biên phải cho tất cả box
+        end_offset_y = [0.03] * part_ii_count  # 3% từ đáy để tránh dính viền đậm
         
         grid_result_ii = extract_grid_from_boxes_variable_offsets(
             combined_grid_image,
@@ -2950,31 +3905,33 @@ def _demo(image_arg: Optional[str] = None) -> None:
             start_offset_ratios=offset_ratios,
             end_offset_ratios_x=end_offset_x,
             end_offset_ratios_y=end_offset_y,
-            grid_color=(0, 165, 255),  # Orange
+            grid_color=(0, 165, 255),  # Màu cam
             grid_thickness=1,
         )
         combined_grid_image = grid_result_ii["image_with_grid"]
-        part_ii_grid_info = grid_result_ii["grid_info"]
-        
-        print(f"Grid drawn on {len(grid_result_ii['grid_info'])} boxes")
-        for info in grid_result_ii["grid_info"]:
-            print(f"  Box {info['box_idx']}: offset {info['offset_ratios']}, end_y -{info['end_offset_y']*100:.0f}%, "
-                  f"region {info['region_size']}, cell_size ~{info['cell_size'][0]:.1f}x{info['cell_size'][1]:.1f}")
+
+        _print_grid_info(
+            grid_result_ii["grid_info"],
+            detail_formatter=lambda info: (
+                f"offset {info['offset_ratios']}, end_y -{info['end_offset_y'] * 100:.0f}%"
+            ),
+        )
+        part_ii_evals = _evaluate_section_fill(
+            section_name="Part II",
+            binary_threshold=binary_threshold,
+            grid_info=grid_result_ii["grid_info"],
+            fill_ratio_thresh=0.54,
+            inner_margin_ratio=0.01,
+            circle_radius_scale=0.6,
+            circle_border_exclude_ratio=0.1,
+        )
     
-    # Draw 3x2 grid on Part III boxes
+    # Phần III: lưới 4x12 với pattern hàng đầu đặc biệt theo mẫu đề.
+    part_iii_evals: List[Dict[str, object]] = []
     if parts["part_iii"]:
         print(f"\n=== Part III: 4x12 grid with custom pattern (20% x, 10% y) ===")
-        # Custom pattern for Part III:
-        # Row 0: only column 0 (first cell)
-        # Row 1: columns 1, 2 (middle two cells)
-        # Rows 2-11: all columns 0-3 (normal)
-        custom_pattern = [
-            [0],                # Row 0: only 1st cell
-            [1, 2],             # Row 1: 2nd and 3rd cells (middle)
-        ]
-        # Add rows 2-11 with all 4 columns
-        for _ in range(10):
-            custom_pattern.append([0, 1, 2, 3])
+        # Pattern Part III: 2 hàng đầu đặc biệt, các hàng sau dùng đủ 4 cột.
+        custom_pattern = [[0], [1, 2]] + [[0, 1, 2, 3] for _ in range(10)]
         
         grid_result_iii = extract_grid_from_boxes_custom_pattern(
             combined_grid_image,
@@ -2983,91 +3940,97 @@ def _demo(image_arg: Optional[str] = None) -> None:
             grid_rows=12,
             start_offset_ratio_x=0.22,
             start_offset_ratio_y=0.16,
-            end_offset_ratio_x=0.05,
+            end_offset_ratio_x=0.1,
             end_offset_ratio_y=0.015,
-            grid_color=(255, 0, 0),  # Blue (BGR format, so red in display)
+            grid_color=(255, 0, 0),  # BGR: hiển thị màu đỏ
             grid_thickness=1,
             row_col_patterns=custom_pattern,
         )
         combined_grid_image = grid_result_iii["image_with_grid"]
-        part_iii_grid_info = grid_result_iii["grid_info"]
-        
-        print(f"Grid drawn on {len(grid_result_iii['grid_info'])} boxes")
-        for info in grid_result_iii["grid_info"]:
-            print(f"  Box {info['box_idx']}: region {info['region_size']}, "
-                  f"cell_size ~{info['cell_size'][0]:.1f}x{info['cell_size'][1]:.1f}, "
-                  f"pattern={info['pattern'][:2]}... (12 rows total)")
 
-    # Draw SoBaoDanh and MaDe box grids on the same combined grid image.
-    # These sections are already grid-like bubble matrices, so draw their box contours.
-    sobao_grid_color = (255, 128, 0)  # Orange
+        _print_grid_info(
+            grid_result_iii["grid_info"],
+            detail_formatter=lambda info: f"pattern={info['pattern'][:2]}... (12 rows total)",
+        )
+        part_iii_evals = _evaluate_section_fill(
+            section_name="Part III",
+            binary_threshold=binary_threshold,
+            grid_info=grid_result_iii["grid_info"],
+            fill_ratio_thresh=0.54,
+            inner_margin_ratio=0.05,
+            circle_radius_scale=0.6,
+            circle_border_exclude_ratio=0.1,
+        )
+
+    # Vẽ lưới contour của SBD/Mã đề trên ảnh tổng hợp để đối chiếu toàn cục.
+    sobao_grid_color = (255, 128, 0)  # Cam
     ma_de_grid_color = (255, 255, 0)  # Cyan
 
     if sobao_danh["sobao_danh_rows"]:
         print(f"\n=== SoBaoDanh: drawing detected box grid ===")
-        for row in sobao_danh["sobao_danh_rows"]:
-            for poly in row:
-                cv2.polylines(combined_grid_image, [poly], True, sobao_grid_color, 1)
-        print(f"Grid drawn on {len(sobao_danh['sobao_danh'])} SoBaoDanh boxes")
+        sobao_count = _draw_rows_contours(
+            combined_grid_image,
+            sobao_danh["sobao_danh_rows"],
+            sobao_grid_color,
+            thickness=1,
+        )
+        print(f"Grid drawn on {sobao_count} SoBaoDanh boxes")
 
     if ma_de["ma_de_rows"]:
         print(f"\n=== MaDe: drawing detected box grid ===")
-        for row in ma_de["ma_de_rows"]:
-            for poly in row:
-                cv2.polylines(combined_grid_image, [poly], True, ma_de_grid_color, 1)
-        print(f"Grid drawn on {len(ma_de['ma_de'])} MaDe boxes")
+        ma_de_count = _draw_rows_contours(
+            combined_grid_image,
+            ma_de["ma_de_rows"],
+            ma_de_grid_color,
+            thickness=1,
+        )
+        print(f"Grid drawn on {ma_de_count} MaDe boxes")
+
+    combined_grid_image = draw_digit_darkness_overlay(
+        combined_grid_image,
+        sbd_digits,
+        color=(0, 220, 255),
+        alpha=0.40,
+    )
+    combined_grid_image = draw_digit_darkness_overlay(
+        combined_grid_image,
+        made_digits,
+        color=(0, 255, 255),
+        alpha=0.40,
+    )
+
+    all_evals = part_i_evals + part_ii_evals + part_iii_evals
+    if all_evals:
+        combined_grid_image = draw_filled_cells_overlay(
+            combined_grid_image,
+            all_evals,
+            color=(0, 255, 0),
+            alpha=0.35,
+        )
+
+        if binary_threshold is not None:
+            binary_fillratio_path = f"{debug_prefix}_binary_fillratio_grid.jpg"
+            draw_binary_fillratio_debug(binary_threshold, all_evals, binary_fillratio_path)
+            print(f"✓ Binary fill-ratio debug image saved to: {binary_fillratio_path}")
     
-    # Save combined image with all grids
+    # Lưu ảnh tổng hợp cuối: gồm lưới, overlay ô tô và kết quả debug.
     combined_grid_path = f"{debug_prefix}_all_parts_with_grid.jpg"
     cv2.imwrite(combined_grid_path, combined_grid_image)
     print(f"\n✓ Combined grid image saved to: {combined_grid_path}")
 
-    # Use a separate raw morphology horizontal image for fill/empty classification
-    # so box detection logic remains unchanged.
-    raw_grid = detect_grid_points(
-        image=img,
-        vertical_scale=0.015,
-        horizontal_scale=0.015,
-        min_point_area=8,
-        block_size=35,
-        block_offset=7,
-        debug_prefix=None,
-    )
-    horizontal_binary = raw_grid["horizontal"]
-    fill_eval = evaluate_grid_cells_with_horizontal_binary(
-        original_image=original_image,
-        horizontal_binary=horizontal_binary,
-        part_i_grid_info=part_i_grid_info,
-        part_ii_grid_info=part_ii_grid_info,
-        part_iii_grid_info=part_iii_grid_info,
-        sobao_danh_rows=sobao_danh.get("sobao_danh_rows"),
-        ma_de_rows=ma_de.get("ma_de_rows"),
-        debug_prefix=debug_prefix,
-    )
-
-    print("\n=== Horizontal Binary Fill Summary ===")
-    for section in ["part_i", "part_ii", "part_iii", "sobaodanh", "made"]:
-        sec_summary = fill_eval["summary"].get(section)
-        if not sec_summary:
-            continue
-        print(f"  {section}: {sec_summary['filled']}/{sec_summary['total']} filled")
-    print(f"  Saved binary debug: {debug_prefix}_horizontal_binary.jpg")
-    print(f"  Saved ratio debug: {debug_prefix}_horizontal_fill_ratio_debug.jpg")
-    print(f"  Saved fill debug: {debug_prefix}_grid_filled_from_horizontal.jpg")
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Detect and draw answer grids from form images.")
+    parser = argparse.ArgumentParser(description="Phát hiện và vẽ lưới đáp án từ ảnh phiếu.")
     parser.add_argument(
         "image",
         nargs="?",
         default=None,
-        help="Image identifier, e.g. 0015, 31, PhieuQG.0031, or PhieuQG/PhieuQG.0031.jpg",
+        help="Định danh ảnh, ví dụ: 0015, 31, PhieuQG.0031, hoặc PhieuQG/PhieuQG.0031.jpg",
     )
     parser.add_argument(
         "--image",
         dest="image_opt",
         default=None,
-        help="Image identifier (same accepted formats as positional image).",
+        help="Định danh ảnh (chấp nhận cùng định dạng như tham số vị trí image).",
     )
     args = parser.parse_args()
     _demo(image_arg=args.image_opt or args.image)
