@@ -513,6 +513,219 @@ def _digit_eval_table(result: Dict[str, object]) -> List[Dict[str, object]]:
     return out
 
 
+def _build_json_payload(extracted: Dict[str, object]) -> Dict[str, object]:
+    return {
+        "res": {
+            "fc": extracted["fc"],
+            "fc_invalid": sorted(extracted["fc_invalid"], key=int),
+            "tf": extracted["tf"],
+            "tf_invalid": sorted(extracted["tf_invalid"], key=int),
+            "dg": extracted["dg"],
+            "dg_invalid": sorted(extracted["dg_invalid"], key=int),
+            "sbd": extracted["sbd"],
+            "sbd_invalid": extracted["sbd_invalid"],
+            "mdt": extracted["mdt"],
+            "mdt_invalid": extracted["mdt_invalid"],
+        },
+        "sbd": extracted["sbd"],
+        "mdt": extracted["mdt"],
+    }
+
+
+def _build_batch_summary_row(
+    file_name: str,
+    status: str,
+    results: Optional[Dict[str, object]],
+    extracted: Optional[Dict[str, object]],
+    error_message: str = "",
+) -> Dict[str, object]:
+    if status != "OK" or results is None or extracted is None:
+        return {
+            "File": file_name,
+            "Status": status,
+            "SBD": "",
+            "Mã đề": "",
+            "Part I": "",
+            "Part II": "",
+            "Part III": "",
+            "Boxes": "",
+            "Preprocess": "",
+            "Error": error_message,
+        }
+
+    fc_valid = sum(1 for v in extracted["fc"].values() if v and v[0] >= 0)
+    tf_valid = sum(1 for v in extracted["tf"].values() if v and v[0] >= 0)
+    dg_valid = sum(1 for v in extracted["dg"].values() if v and v != "X")
+
+    return {
+        "File": file_name,
+        "Status": status,
+        "SBD": extracted["sbd"],
+        "Mã đề": extracted["mdt"],
+        "Part I": f"{fc_valid}/40",
+        "Part II": f"{tf_valid}/32",
+        "Part III": f"{dg_valid}/6",
+        "Boxes": len(results["data"]["boxes"]),
+        "Preprocess": results["preprocess_mode"],
+        "Error": "",
+    }
+
+
+def _render_detailed_result(
+    results: Dict[str, object],
+    extracted: Dict[str, object],
+    debug_mode: bool,
+) -> None:
+    st.markdown("---")
+    st.subheader("📝 Câu Trả Lời Được Trích Xuất")
+
+    tab1, tab2, tab3, tab4, tab5, tab_json = st.tabs(
+        ["SBD (ID)", "Mã Đề", "Phần I", "Phần II", "Phần III", "JSON"]
+    )
+
+    with tab1:
+        st.markdown("### Số Báo Danh")
+        if extracted["sbd"]:
+            if extracted["sbd_invalid"]:
+                st.warning(f"SBD: {extracted['sbd']} (chưa chắc chắn hoàn toàn)")
+            else:
+                st.success(f"SBD: {extracted['sbd']}")
+            st.dataframe(_digit_eval_table(results["sbd_digits"]), use_container_width=True)
+        else:
+            st.info("Không tìm thấy dữ liệu SBD")
+
+    with tab2:
+        st.markdown("### Mã Đề")
+        if extracted["mdt"]:
+            if extracted["mdt_invalid"]:
+                st.warning(f"Mã Đề: {extracted['mdt']} (chưa chắc chắn hoàn toàn)")
+            else:
+                st.success(f"Mã Đề: {extracted['mdt']}")
+            st.dataframe(_digit_eval_table(results["made_digits"]), use_container_width=True)
+        else:
+            st.info("Không tìm thấy dữ liệu Mã Đề")
+
+    with tab3:
+        st.markdown("### Phần I - Trắc Nghiệm (40 câu)")
+        fc_data = extracted["fc"]
+        fc_invalid = extracted["fc_invalid"]
+        choice_map = {0: "A", 1: "B", 2: "C", 3: "D", -2: "X"}
+
+        if any(fc_data.values()):
+            if fc_invalid:
+                st.warning(
+                    f"⚠️ {len(fc_invalid)} câu có nhiều đáp án: {', '.join(sorted(fc_invalid, key=int))}"
+                )
+
+            cols = st.columns(4)
+            for q_num in range(1, 41):
+                q_str = str(q_num)
+                answer_idx = fc_data[q_str][0] if fc_data[q_str] else -1
+                answer_letter = choice_map.get(answer_idx, "-")
+                col_idx = (q_num - 1) % 4
+                with cols[col_idx]:
+                    st.metric(f"Q{q_num}", answer_letter)
+
+            total_answers = sum(1 for v in fc_data.values() if v and v[0] >= 0)
+            st.info(f"Tổng cộng câu trả lời hợp lệ: {total_answers}/40")
+        else:
+            st.info("Không phát hiện câu trả lời nào trong Phần I")
+
+    with tab4:
+        st.markdown("### Phần II - Đúng/Sai (32 câu)")
+        tf_data = extracted["tf"]
+        tf_invalid = extracted["tf_invalid"]
+        choice_map = {0: "Sai", 1: "Đúng", -2: "X"}
+
+        if any(tf_data.values()):
+            if tf_invalid:
+                st.warning(
+                    f"⚠️ {len(tf_invalid)} câu có nhiều đáp án: {', '.join(sorted(tf_invalid, key=int))}"
+                )
+
+            cols = st.columns(4)
+            for q_num in range(1, 33):
+                q_str = str(q_num)
+                answer_idx = tf_data[q_str][0] if tf_data[q_str] else -1
+                answer_text = choice_map.get(answer_idx, "-")
+                col_idx = (q_num - 1) % 4
+                with cols[col_idx]:
+                    st.metric(f"Q{q_num}", answer_text)
+
+            total_answers = sum(1 for v in tf_data.values() if v and v[0] >= 0)
+            st.info(f"Tổng cộng câu trả lời hợp lệ: {total_answers}/32")
+        else:
+            st.info("Không phát hiện câu trả lời nào trong Phần II")
+
+    with tab5:
+        st.markdown("### Phần III - Nhập Số (6 câu)")
+        dg_data = extracted["dg"]
+        dg_invalid = extracted["dg_invalid"]
+
+        if any(dg_data.values()):
+            if dg_invalid:
+                st.warning(
+                    f"⚠️ {len(dg_invalid)} câu không hợp lệ: {', '.join(sorted(dg_invalid, key=int))}"
+                )
+
+            cols = st.columns(3)
+            for cau_num in range(1, 7):
+                cau_str = str(cau_num)
+                answer = dg_data[cau_str]
+                col_idx = (cau_num - 1) % 3
+                with cols[col_idx]:
+                    st.metric(f"Câu {cau_num}", answer if answer else "-")
+
+            total_answers = sum(1 for v in dg_data.values() if v and v != "X")
+            st.info(f"Tổng cộng câu trả lời hợp lệ: {total_answers}/6")
+        else:
+            st.info("Không phát hiện câu trả lời nào trong Phần III")
+
+    with tab_json:
+        st.markdown("### JSON Output")
+        json_payload = _build_json_payload(extracted)
+        st.json(json_payload)
+        st.code(json.dumps([json_payload], indent=2, ensure_ascii=False), language="json")
+
+    if debug_mode:
+        st.markdown("---")
+        st.subheader("🔍 Thông Tin Debug")
+
+        debug_col1, debug_col2 = st.columns(2)
+        with debug_col1:
+            st.markdown("**Overlay Parts**")
+            st.image(_to_rgb(results["parts_overlay"]), use_container_width=True)
+        with debug_col2:
+            if results["binary_threshold"] is not None:
+                st.markdown("**Binary Threshold**")
+                st.image(_to_rgb(results["binary_threshold"]), use_container_width=True)
+            else:
+                st.markdown("**Boxes Overlay**")
+                st.image(_to_rgb(results["data"]["boxes_overlay"]), use_container_width=True)
+
+        part_i_evals = results["part_i_evals"]
+        part_ii_evals = results["part_ii_evals"]
+        part_iii_evals = results["part_iii_evals"]
+        total_cells = len(part_i_evals) + len(part_ii_evals) + len(part_iii_evals)
+        total_filled = sum(1 for e in (part_i_evals + part_ii_evals + part_iii_evals) if e.get("filled", False))
+
+        stats_col1, stats_col2, stats_col3 = st.columns(3)
+        with stats_col1:
+            st.metric("Detected Boxes", len(results["data"]["boxes"]))
+        with stats_col2:
+            st.metric("Tổng Cộng Ô", total_cells)
+        with stats_col3:
+            pct = (total_filled / max(1, total_cells)) * 100.0
+            st.metric("Tỷ Lệ Điền", f"{pct:.1f}%")
+
+        st.caption(
+            f"Preprocess: {results['preprocess_mode']} | "
+            f"Part I/II/III: {len(results['parts']['part_i'])}/"
+            f"{len(results['parts']['part_ii'])}/{len(results['parts']['part_iii'])} | "
+            f"Upper split X: {float(results['split_x']):.1f}"
+        )
+
+
 st.set_page_config(
     page_title="Nhận dạng phiếu trả lời",
     page_icon="📊",
@@ -541,227 +754,172 @@ col1, col2 = st.columns([1, 1], gap="medium")
 
 with col1:
     st.subheader("📤 Tải Lên Hình Ảnh")
-    uploaded_file = st.file_uploader("Chọn ảnh phiếu", type=["jpg", "jpeg", "png", "bmp"])
+    uploaded_files = st.file_uploader(
+        "Chọn 1 hoặc nhiều ảnh phiếu",
+        type=["jpg", "jpeg", "png", "bmp"],
+        accept_multiple_files=True,
+    )
+    process_clicked = st.button(
+        "🚀 Bắt đầu xử lý",
+        type="primary",
+        use_container_width=True,
+        disabled=not uploaded_files,
+    )
 
-if uploaded_file is not None:
-    file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-    image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+BATCH_RESULTS_KEY = "batch_results"
+BATCH_SIGNATURE_KEY = "batch_signature"
 
-    if image is None:
-        st.error("❌ Không đọc được ảnh tải lên.")
-        st.stop()
+if BATCH_RESULTS_KEY not in st.session_state:
+    st.session_state[BATCH_RESULTS_KEY] = []
+if BATCH_SIGNATURE_KEY not in st.session_state:
+    st.session_state[BATCH_SIGNATURE_KEY] = ()
 
-    with col1:
-        st.subheader("📸 Hình Ảnh Gốc")
-        st.image(_to_rgb(image), use_container_width=True)
+current_signature: Tuple[Tuple[str, int], ...] = ()
+if uploaded_files:
+    current_signature = tuple((f.name, int(getattr(f, "size", 0))) for f in uploaded_files)
 
+if process_clicked and uploaded_files:
     progress_bar = st.progress(0)
     status_text = st.empty()
 
-    try:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            status_text.text("Bước 1/3: Chuẩn bị dữ liệu...")
-            progress_bar.progress(15)
+    batch_results: List[Dict[str, object]] = []
+    total_files = len(uploaded_files)
 
-            debug_prefix = str(Path(temp_dir) / "grid") if debug_mode else None
+    with tempfile.TemporaryDirectory() as temp_dir:
+        for idx, uploaded in enumerate(uploaded_files, start=1):
+            file_name = uploaded.name
+            status_text.text(f"Đang xử lý {idx}/{total_files}: {file_name}")
+            progress_bar.progress(int(((idx - 1) / max(1, total_files)) * 100))
 
-            status_text.text("Bước 2/3: Chạy pipeline detect.py...")
-            progress_bar.progress(55)
-            results = _process_image_with_main_logic(
-                image,
-                fill_ratio_phan1=fill_ratio_phan1,
-                fill_ratio_phan2=fill_ratio_phan2,
-                fill_ratio_phan3=fill_ratio_phan3,
-                debug_prefix=debug_prefix,
-            )
+            try:
+                file_bytes = np.asarray(bytearray(uploaded.getvalue()), dtype=np.uint8)
+                image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+                if image is None:
+                    raise ValueError("Không đọc được ảnh")
 
-            status_text.text("Bước 3/3: Tổng hợp kết quả...")
-            progress_bar.progress(90)
-            extracted = _build_structured_answers(results)
+                debug_prefix = None
+                if debug_mode:
+                    stem = Path(file_name).stem
+                    debug_prefix = str(Path(temp_dir) / f"grid_{stem}")
 
-            progress_bar.progress(100)
-            status_text.text("Hoàn thành")
+                results = _process_image_with_main_logic(
+                    image,
+                    fill_ratio_phan1=fill_ratio_phan1,
+                    fill_ratio_phan2=fill_ratio_phan2,
+                    fill_ratio_phan3=fill_ratio_phan3,
+                    debug_prefix=debug_prefix,
+                )
+                extracted = _build_structured_answers(results)
 
-            with col2:
-                st.subheader("📊 Kết Quả Phân Tích")
-                st.image(_to_rgb(results["result_image"]), use_container_width=True)
-
-            st.markdown("---")
-            st.subheader("📝 Câu Trả Lời Được Trích Xuất")
-
-            tab1, tab2, tab3, tab4, tab5, tab_json = st.tabs(
-                ["SBD (ID)", "Mã Đề", "Phần I", "Phần II", "Phần III", "JSON"]
-            )
-
-            with tab1:
-                st.markdown("### Số Báo Danh")
-                if extracted["sbd"]:
-                    if extracted["sbd_invalid"]:
-                        st.warning(f"SBD: {extracted['sbd']} (chưa chắc chắn hoàn toàn)")
-                    else:
-                        st.success(f"SBD: {extracted['sbd']}")
-                    st.dataframe(_digit_eval_table(results["sbd_digits"]), use_container_width=True)
-                else:
-                    st.info("Không tìm thấy dữ liệu SBD")
-
-            with tab2:
-                st.markdown("### Mã Đề")
-                if extracted["mdt"]:
-                    if extracted["mdt_invalid"]:
-                        st.warning(f"Mã Đề: {extracted['mdt']} (chưa chắc chắn hoàn toàn)")
-                    else:
-                        st.success(f"Mã Đề: {extracted['mdt']}")
-                    st.dataframe(_digit_eval_table(results["made_digits"]), use_container_width=True)
-                else:
-                    st.info("Không tìm thấy dữ liệu Mã Đề")
-
-            with tab3:
-                st.markdown("### Phần I - Trắc Nghiệm (40 câu)")
-                fc_data = extracted["fc"]
-                fc_invalid = extracted["fc_invalid"]
-                choice_map = {0: "A", 1: "B", 2: "C", 3: "D", -2: "X"}
-
-                if any(fc_data.values()):
-                    if fc_invalid:
-                        st.warning(
-                            f"⚠️ {len(fc_invalid)} câu có nhiều đáp án: {', '.join(sorted(fc_invalid, key=int))}"
-                        )
-
-                    cols = st.columns(4)
-                    for q_num in range(1, 41):
-                        q_str = str(q_num)
-                        answer_idx = fc_data[q_str][0] if fc_data[q_str] else -1
-                        answer_letter = choice_map.get(answer_idx, "-")
-                        col_idx = (q_num - 1) % 4
-                        with cols[col_idx]:
-                            st.metric(f"Q{q_num}", answer_letter)
-
-                    total_answers = sum(1 for v in fc_data.values() if v and v[0] >= 0)
-                    st.info(f"Tổng cộng câu trả lời hợp lệ: {total_answers}/40")
-                else:
-                    st.info("Không phát hiện câu trả lời nào trong Phần I")
-
-            with tab4:
-                st.markdown("### Phần II - Đúng/Sai (32 câu)")
-                tf_data = extracted["tf"]
-                tf_invalid = extracted["tf_invalid"]
-                choice_map = {0: "Sai", 1: "Đúng", -2: "X"}
-
-                if any(tf_data.values()):
-                    if tf_invalid:
-                        st.warning(
-                            f"⚠️ {len(tf_invalid)} câu có nhiều đáp án: {', '.join(sorted(tf_invalid, key=int))}"
-                        )
-
-                    cols = st.columns(4)
-                    for q_num in range(1, 33):
-                        q_str = str(q_num)
-                        answer_idx = tf_data[q_str][0] if tf_data[q_str] else -1
-                        answer_text = choice_map.get(answer_idx, "-")
-                        col_idx = (q_num - 1) % 4
-                        with cols[col_idx]:
-                            st.metric(f"Q{q_num}", answer_text)
-
-                    total_answers = sum(1 for v in tf_data.values() if v and v[0] >= 0)
-                    st.info(f"Tổng cộng câu trả lời hợp lệ: {total_answers}/32")
-                else:
-                    st.info("Không phát hiện câu trả lời nào trong Phần II")
-
-            with tab5:
-                st.markdown("### Phần III - Nhập Số (6 câu)")
-                dg_data = extracted["dg"]
-                dg_invalid = extracted["dg_invalid"]
-
-                if any(dg_data.values()):
-                    if dg_invalid:
-                        st.warning(
-                            f"⚠️ {len(dg_invalid)} câu không hợp lệ: {', '.join(sorted(dg_invalid, key=int))}"
-                        )
-
-                    cols = st.columns(3)
-                    for cau_num in range(1, 7):
-                        cau_str = str(cau_num)
-                        answer = dg_data[cau_str]
-                        col_idx = (cau_num - 1) % 3
-                        with cols[col_idx]:
-                            st.metric(f"Câu {cau_num}", answer if answer else "-")
-
-                    total_answers = sum(1 for v in dg_data.values() if v and v != "X")
-                    st.info(f"Tổng cộng câu trả lời hợp lệ: {total_answers}/6")
-                else:
-                    st.info("Không phát hiện câu trả lời nào trong Phần III")
-
-            with tab_json:
-                st.markdown("### JSON Output")
-                json_payload = {
-                    "res": {
-                        "fc": extracted["fc"],
-                        "fc_invalid": sorted(extracted["fc_invalid"], key=int),
-                        "tf": extracted["tf"],
-                        "tf_invalid": sorted(extracted["tf_invalid"], key=int),
-                        "dg": extracted["dg"],
-                        "dg_invalid": sorted(extracted["dg_invalid"], key=int),
-                        "sbd": extracted["sbd"],
-                        "sbd_invalid": extracted["sbd_invalid"],
-                        "mdt": extracted["mdt"],
-                        "mdt_invalid": extracted["mdt_invalid"],
-                    },
-                    "sbd": extracted["sbd"],
-                    "mdt": extracted["mdt"],
-                }
-                st.json(json_payload)
-                st.code(json.dumps([json_payload], indent=2, ensure_ascii=False), language="json")
-
-            if debug_mode:
-                st.markdown("---")
-                st.subheader("🔍 Thông Tin Debug")
-
-                debug_col1, debug_col2 = st.columns(2)
-                with debug_col1:
-                    st.markdown("**Overlay Parts**")
-                    st.image(_to_rgb(results["parts_overlay"]), use_container_width=True)
-                with debug_col2:
-                    if results["binary_threshold"] is not None:
-                        st.markdown("**Binary Threshold**")
-                        st.image(_to_rgb(results["binary_threshold"]), use_container_width=True)
-                    else:
-                        st.markdown("**Boxes Overlay**")
-                        st.image(_to_rgb(results["data"]["boxes_overlay"]), use_container_width=True)
-
-                part_i_evals = results["part_i_evals"]
-                part_ii_evals = results["part_ii_evals"]
-                part_iii_evals = results["part_iii_evals"]
-                total_cells = len(part_i_evals) + len(part_ii_evals) + len(part_iii_evals)
-                total_filled = sum(1 for e in (part_i_evals + part_ii_evals + part_iii_evals) if e.get("filled", False))
-
-                stats_col1, stats_col2, stats_col3 = st.columns(3)
-                with stats_col1:
-                    st.metric("Detected Boxes", len(results["data"]["boxes"]))
-                with stats_col2:
-                    st.metric("Tổng Cộng Ô", total_cells)
-                with stats_col3:
-                    pct = (total_filled / max(1, total_cells)) * 100.0
-                    st.metric("Tỷ Lệ Điền", f"{pct:.1f}%")
-
-                st.caption(
-                    f"Preprocess: {results['preprocess_mode']} | "
-                    f"Part I/II/III: {len(results['parts']['part_i'])}/"
-                    f"{len(results['parts']['part_ii'])}/{len(results['parts']['part_iii'])} | "
-                    f"Upper split X: {float(results['split_x']):.1f}"
+                batch_results.append(
+                    {
+                        "file_name": file_name,
+                        "status": "OK",
+                        "error": "",
+                        "image": image,
+                        "results": results,
+                        "extracted": extracted,
+                        "summary": _build_batch_summary_row(file_name, "OK", results, extracted),
+                    }
+                )
+            except Exception as err:
+                batch_results.append(
+                    {
+                        "file_name": file_name,
+                        "status": "ERROR",
+                        "error": str(err),
+                        "image": None,
+                        "results": None,
+                        "extracted": None,
+                        "summary": _build_batch_summary_row(
+                            file_name,
+                            "ERROR",
+                            None,
+                            None,
+                            error_message=str(err),
+                        ),
+                    }
                 )
 
-    except Exception as err:
-        st.error(f"❌ Lỗi khi xử lý hình ảnh: {err}")
-        st.info("Vui lòng kiểm tra ảnh đầu vào hoặc thử ảnh khác.")
+    progress_bar.progress(100)
+    status_text.text(f"Hoàn thành xử lý {len(uploaded_files)} ảnh")
+    st.session_state[BATCH_RESULTS_KEY] = batch_results
+    st.session_state[BATCH_SIGNATURE_KEY] = current_signature
+
+has_batch_results = (
+    bool(uploaded_files)
+    and bool(st.session_state[BATCH_RESULTS_KEY])
+    and st.session_state[BATCH_SIGNATURE_KEY] == current_signature
+)
+
+if has_batch_results:
+    batch_results = st.session_state[BATCH_RESULTS_KEY]
+    summary_rows = [item["summary"] for item in batch_results]
+    success_items = [item for item in batch_results if item["status"] == "OK"]
+    error_items = [item for item in batch_results if item["status"] != "OK"]
+
+    st.markdown("---")
+    st.subheader("📋 Kết Quả Tổng Hợp")
+
+    metric_col1, metric_col2, metric_col3 = st.columns(3)
+    with metric_col1:
+        st.metric("Tổng số ảnh", len(batch_results))
+    with metric_col2:
+        st.metric("Thành công", len(success_items))
+    with metric_col3:
+        st.metric("Lỗi", len(error_items))
+
+    st.dataframe(summary_rows, use_container_width=True)
+
+    combined_payload = []
+    for item in success_items:
+        payload = _build_json_payload(item["extracted"])
+        payload["file_name"] = item["file_name"]
+        combined_payload.append(payload)
+
+    st.download_button(
+        label="⬇️ Tải JSON tổng hợp",
+        data=json.dumps(combined_payload, indent=2, ensure_ascii=False),
+        file_name="ket_qua_tong_hop.json",
+        mime="application/json",
+        use_container_width=True,
+        disabled=not combined_payload,
+    )
+
+    if success_items:
+        selected_file_name = st.selectbox(
+            "Chọn ảnh để xem chi tiết",
+            options=[item["file_name"] for item in success_items],
+        )
+        selected_item = next(item for item in success_items if item["file_name"] == selected_file_name)
+
+        with col1:
+            st.subheader("📸 Hình Ảnh Gốc")
+            st.image(_to_rgb(selected_item["image"]), use_container_width=True)
+
+        with col2:
+            st.subheader("📊 Kết Quả Phân Tích")
+            st.image(_to_rgb(selected_item["results"]["result_image"]), use_container_width=True)
+
+        _render_detailed_result(
+            selected_item["results"],
+            selected_item["extracted"],
+            debug_mode=debug_mode,
+        )
+    else:
+        st.error("Không có ảnh nào xử lý thành công để hiển thị chi tiết.")
+elif uploaded_files:
+    st.info("Nhấn '🚀 Bắt đầu xử lý' để chạy batch và xem tiến độ/kết quả tổng hợp.")
 else:
     st.info("👆 Tải lên một hình ảnh để bắt đầu")
     st.markdown("---")
     st.subheader("📖 Cách sử dụng")
     st.markdown(
         """
-        1. Tải lên ảnh phiếu trả lời.
+        1. Tải lên một hoặc nhiều ảnh phiếu trả lời.
         2. Chỉnh ngưỡng fill ratio ở thanh bên nếu cần.
-        3. Xem ảnh kết quả và các tab trích xuất đáp án.
-        4. Bật Debug để xem thêm thông tin nội bộ của pipeline.
+        3. Nhấn nút xử lý để theo dõi tiến độ batch.
+        4. Xem bảng tổng hợp và chọn từng ảnh để xem chi tiết.
+        5. Bật Debug để xem thêm thông tin nội bộ của pipeline.
         """
     )

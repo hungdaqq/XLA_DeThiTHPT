@@ -2752,6 +2752,24 @@ def detect_sobao_danh_boxes(
         # Hàm hỗ trợ một bước xử lý trong pipeline chấm phiếu.
         return _is_uniform_size_group(group, size_tolerance_ratio)
 
+    def has_excessive_x_overlap(
+        row_boxes: List[np.ndarray],
+        max_overlap_pairs: int = 1,
+        overlap_tol_px: int = 1,
+    ) -> bool:
+        # Hàm hỗ trợ một bước xử lý trong pipeline chấm phiếu.
+        # Một hàng SBD hợp lệ gần như không có box chồng nhau theo trục X.
+        rects = sorted([cv2.boundingRect(b) for b in row_boxes], key=lambda r: r[0])
+        overlap_pairs = 0
+        for i in range(len(rects) - 1):
+            x0, y0, w0, h0 = rects[i]
+            x1, y1, w1, h1 = rects[i + 1]
+            if x0 + w0 > x1 + overlap_tol_px:
+                overlap_pairs += 1
+                if overlap_pairs > max_overlap_pairs:
+                    return True
+        return False
+
     def _try_recover_merged_row(group: List[Dict[str, object]]) -> Optional[List[np.ndarray]]:
         # Hàm hỗ trợ một bước xử lý trong pipeline chấm phiếu.
         # Recovery for rows where one merged contour combines two adjacent bubbles
@@ -2822,9 +2840,13 @@ def detect_sobao_danh_boxes(
         # Only accept rows with exactly boxes_per_row boxes and uniform size
         if len(group) == boxes_per_row and is_uniform_size(group):
             sorted_boxes = [b["box"] for b in sorted(group, key=lambda b: b["x"])]
-            sobao_danh_rows.append(sorted_boxes)
-            if debug:
-                print(f"  ✓ Group {idx} matched as SoBaoDanh row {len(sobao_danh_rows)}")
+            if has_excessive_x_overlap(sorted_boxes):
+                if debug:
+                    print(f"  ✗ Group {idx} rejected: excessive X overlap in 6-box row")
+            else:
+                sobao_danh_rows.append(sorted_boxes)
+                if debug:
+                    print(f"  ✓ Group {idx} matched as SoBaoDanh row {len(sobao_danh_rows)}")
         elif len(group) > boxes_per_row:
             # Try to extract non-overlapping 6-box rows from larger groups
             sorted_group = sorted(group, key=lambda b: b["x"])
@@ -2839,6 +2861,12 @@ def detect_sobao_danh_boxes(
                 
                 if is_uniform_size(sub_group):
                     sorted_boxes = [b["box"] for b in sub_group]
+                    if has_excessive_x_overlap(sorted_boxes):
+                        if debug:
+                            print(
+                                f"  ✗ Group {idx} sub-row {start_idx} rejected: excessive X overlap"
+                            )
+                        continue
                     sobao_danh_rows.append(sorted_boxes)
                     # Mark these boxes as used
                     for i in range(start_idx, start_idx + boxes_per_row):
@@ -2866,6 +2894,10 @@ def detect_sobao_danh_boxes(
         size_tolerance_ratio,
         debug=debug,
     )
+    sobao_danh_rows = [
+        row for row in sobao_danh_rows
+        if not has_excessive_x_overlap(row)
+    ]
     sobao_danh = [box for row in sobao_danh_rows for box in row]
 
     sobao_danh_rows = _trim_rows_to_consistent_window(sobao_danh_rows, max_rows)
@@ -3298,6 +3330,312 @@ def detect_boxes_from_morph_lines(
     return result
 
 
+def detect_black_corner_markers(
+    image: np.ndarray,
+    debug_prefix: Optional[str] = None,
+) -> Dict[str, object]:
+    # Phát hiện 4 marker đen ở 4 góc ảnh để định vị khung phiếu.
+    h_img, w_img = image.shape[:2]
+    if h_img <= 0 or w_img <= 0:
+        return {
+            "corners": {
+                "top_left": None,
+                "top_right": None,
+                "bottom_right": None,
+                "bottom_left": None,
+            },
+            "ordered_corners": [],
+            "found_count": 0,
+            "all_found": False,
+            "candidate_count": 0,
+            "debug_image_path": None,
+        }
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image.copy()
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    # Marker góc là vùng tối: lấy ngưỡng tối từ Otsu nhưng chặn trên để tránh mask trắng toàn vùng.
+    otsu_val, _ = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    dark_thresh = int(np.clip(0.62 * float(otsu_val), 60.0, 130.0))
+    _, binary_inv = cv2.threshold(blur, dark_thresh, 255, cv2.THRESH_BINARY_INV)
+
+    img_area = float(h_img * w_img)
+    diag = float(np.hypot(w_img, h_img))
+
+    selected: Dict[str, Optional[Tuple[int, int]]] = {
+        "top_left": None,
+        "top_right": None,
+        "bottom_right": None,
+        "bottom_left": None,
+    }
+    selected_bboxes: Dict[str, Optional[Tuple[int, int, int, int]]] = {
+        "top_left": None,
+        "top_right": None,
+        "bottom_right": None,
+        "bottom_left": None,
+    }
+    candidates: List[Dict[str, object]] = []
+
+    def _pick_corner_from_roi(
+        x0: int,
+        y0: int,
+        x1: int,
+        y1: int,
+        target: Tuple[float, float],
+    ) -> Optional[Dict[str, object]]:
+        x0 = int(np.clip(x0, 0, w_img - 1))
+        y0 = int(np.clip(y0, 0, h_img - 1))
+        x1 = int(np.clip(x1, x0 + 1, w_img))
+        y1 = int(np.clip(y1, y0 + 1, h_img))
+
+        roi = binary_inv[y0:y1, x0:x1]
+        contours, _ = cv2.findContours(roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        local_min_area = max(8.0, 0.000002 * img_area)
+        local_max_area = max(local_min_area + 1.0, 0.030 * img_area)
+
+        best = None
+        best_score = -1e9
+        for contour in contours:
+            area = float(cv2.contourArea(contour))
+            if area < local_min_area or area > local_max_area:
+                continue
+
+            rx, ry, rw, rh = cv2.boundingRect(contour)
+            if rw < 3 or rh < 3:
+                continue
+
+            gx, gy = x0 + rx, y0 + ry
+            if gx <= 2 or gy <= 2 or (gx + rw) >= (w_img - 2) or (gy + rh) >= (h_img - 2):
+                continue
+
+            extent = area / float(max(1, rw * rh))
+            aspect = float(rw) / float(rh)
+            if extent < 0.10 or not (0.03 <= aspect <= 35.0):
+                continue
+
+            roi_gray = gray[gy:gy + rh, gx:gx + rw]
+            if roi_gray.size == 0:
+                continue
+            mean_intensity = float(np.mean(roi_gray))
+            if mean_intensity > 235.0:
+                continue
+
+            cx = float(gx + 0.5 * rw)
+            cy = float(gy + 0.5 * rh)
+            distance_norm = float(np.hypot(cx - target[0], cy - target[1])) / max(diag, 1.0)
+            area_norm = area / max(img_area, 1.0)
+            area_boost = min(1.0, area_norm / 0.0015)
+
+            # Ưu tiên gần góc là chính, chỉ dùng extent/area như tín hiệu phụ.
+            score = (0.35 * extent) + (0.10 * area_boost) - (4.0 * distance_norm)
+            if score > best_score:
+                best_score = score
+                best = {
+                    "bbox": (int(gx), int(gy), int(rw), int(rh)),
+                    "center": (int(round(cx)), int(round(cy))),
+                    "area": area,
+                    "extent": extent,
+                    "score": score,
+                }
+
+        return best
+
+    roi_x = max(40, int(round(0.24 * w_img)))
+    roi_y = max(40, int(round(0.24 * h_img)))
+    corner_targets = {
+        "top_left": (0.0, 0.0),
+        "top_right": (float(w_img - 1), 0.0),
+        "bottom_right": (float(w_img - 1), float(h_img - 1)),
+        "bottom_left": (0.0, float(h_img - 1)),
+    }
+
+    corner_rois = {
+        "top_left": (0, 0, roi_x, roi_y),
+        "top_right": (w_img - roi_x, 0, w_img, roi_y),
+        "bottom_right": (w_img - roi_x, h_img - roi_y, w_img, h_img),
+        "bottom_left": (0, h_img - roi_y, roi_x, h_img),
+    }
+
+    for name in ("top_left", "top_right", "bottom_right", "bottom_left"):
+        target = corner_targets[name]
+        x0, y0, x1, y1 = corner_rois[name]
+
+        picked = _pick_corner_from_roi(x0, y0, x1, y1, target)
+        if picked is None:
+            # ROI lớn hơn nếu patch góc đầu tiên không thấy marker.
+            roi_x2 = max(roi_x, int(round(0.34 * w_img)))
+            roi_y2 = max(roi_y, int(round(0.34 * h_img)))
+            if name == "top_left":
+                picked = _pick_corner_from_roi(0, 0, roi_x2, roi_y2, target)
+            elif name == "top_right":
+                picked = _pick_corner_from_roi(w_img - roi_x2, 0, w_img, roi_y2, target)
+            elif name == "bottom_right":
+                picked = _pick_corner_from_roi(w_img - roi_x2, h_img - roi_y2, w_img, h_img, target)
+            else:
+                picked = _pick_corner_from_roi(0, h_img - roi_y2, roi_x2, h_img, target)
+
+        if picked is not None:
+            selected[name] = picked["center"]
+            selected_bboxes[name] = picked["bbox"]
+            candidates.append(picked)
+
+    # Fallback toàn ảnh cho các góc chưa bắt được trong ROI.
+    missing_names = [name for name, pt in selected.items() if pt is None]
+    if missing_names:
+        global_contours, _ = cv2.findContours(binary_inv, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        global_candidates: List[Dict[str, object]] = []
+        min_a = max(8.0, 0.000002 * img_area)
+        max_a = max(min_a + 1.0, 0.035 * img_area)
+
+        for contour in global_contours:
+            area = float(cv2.contourArea(contour))
+            if area < min_a or area > max_a:
+                continue
+            x, y, w, h = cv2.boundingRect(contour)
+            if w < 3 or h < 3:
+                continue
+            if x <= 2 or y <= 2 or (x + w) >= (w_img - 2) or (y + h) >= (h_img - 2):
+                continue
+            extent = area / float(max(1, w * h))
+            aspect = float(w) / float(h)
+            if extent < 0.10 or not (0.03 <= aspect <= 35.0):
+                continue
+
+            roi_gray = gray[y:y + h, x:x + w]
+            if roi_gray.size == 0:
+                continue
+            if float(np.mean(roi_gray)) > 235.0:
+                continue
+
+            cx = float(x + 0.5 * w)
+            cy = float(y + 0.5 * h)
+            global_candidates.append(
+                {
+                    "bbox": (int(x), int(y), int(w), int(h)),
+                    "center": (int(round(cx)), int(round(cy))),
+                    "extent": extent,
+                }
+            )
+
+        used_centers = {pt for pt in selected.values() if pt is not None}
+        for name in missing_names:
+            target = corner_targets[name]
+            best = None
+            best_score = float("inf")
+            for cand in global_candidates:
+                center = cand["center"]
+                if center in used_centers:
+                    continue
+
+                cx, cy = float(center[0]), float(center[1])
+                dist_norm = float(np.hypot(cx - target[0], cy - target[1])) / max(diag, 1.0)
+
+                if name == "top_left":
+                    quadrant_penalty = 0.0 if (cx <= 0.5 * w_img and cy <= 0.5 * h_img) else 0.7
+                elif name == "top_right":
+                    quadrant_penalty = 0.0 if (cx >= 0.5 * w_img and cy <= 0.5 * h_img) else 0.7
+                elif name == "bottom_right":
+                    quadrant_penalty = 0.0 if (cx >= 0.5 * w_img and cy >= 0.5 * h_img) else 0.7
+                else:
+                    quadrant_penalty = 0.0 if (cx <= 0.5 * w_img and cy >= 0.5 * h_img) else 0.7
+
+                score = dist_norm + quadrant_penalty
+                if score < best_score:
+                    best_score = score
+                    best = cand
+
+            if best is not None:
+                selected[name] = best["center"]
+                selected_bboxes[name] = best["bbox"]
+                candidates.append(best)
+                used_centers.add(best["center"])
+
+    # Loại các điểm quá xa góc mục tiêu để tránh nhận nhầm marker giữa cạnh.
+    max_corner_distance_ratio = 0.32
+    for name, pt in list(selected.items()):
+        if pt is None:
+            continue
+        target = corner_targets[name]
+        dist_norm = float(np.hypot(float(pt[0]) - target[0], float(pt[1]) - target[1])) / max(diag, 1.0)
+        if dist_norm > max_corner_distance_ratio:
+            selected[name] = None
+            selected_bboxes[name] = None
+
+    # Kiểm tra hình học vùng hợp lệ để tránh góc bị kéo vào giữa trang.
+    for name, pt in list(selected.items()):
+        if pt is None:
+            continue
+        px, py = float(pt[0]), float(pt[1])
+        invalid = False
+        if name in ("top_left", "top_right") and py > 0.40 * h_img:
+            invalid = True
+        if name in ("bottom_left", "bottom_right") and py < 0.88 * h_img:
+            invalid = True
+        if name in ("top_left", "bottom_left") and px > 0.25 * w_img:
+            invalid = True
+        if name in ("top_right", "bottom_right") and px < 0.75 * w_img:
+            invalid = True
+
+        if invalid:
+            selected[name] = None
+            selected_bboxes[name] = None
+
+    # Nội suy góc thiếu từ các góc còn lại (giả định ảnh gần song song trục).
+    tl = selected["top_left"]
+    tr = selected["top_right"]
+    br = selected["bottom_right"]
+    bl = selected["bottom_left"]
+
+    if br is None and tr is not None and bl is not None:
+        selected["bottom_right"] = (int(tr[0]), int(bl[1]))
+    if bl is None and tl is not None and br is not None:
+        selected["bottom_left"] = (int(tl[0]), int(br[1]))
+    if tr is None and tl is not None and br is not None:
+        selected["top_right"] = (int(br[0]), int(tl[1]))
+    if tl is None and tr is not None and bl is not None:
+        selected["top_left"] = (int(bl[0]), int(tr[1]))
+
+    ordered_corners: List[Tuple[int, int]] = []
+    for name in ("top_left", "top_right", "bottom_right", "bottom_left"):
+        pt = selected[name]
+        if pt is not None:
+            ordered_corners.append(pt)
+
+    debug_image_path = None
+    if debug_prefix:
+        debug_img = image.copy() if image.ndim == 3 else cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        for cand in candidates:
+            x, y, w, h = cand["bbox"]
+            cv2.rectangle(debug_img, (x, y), (x + w, y + h), (255, 180, 0), 2)
+
+        draw_colors = {
+            "top_left": (0, 255, 0),
+            "top_right": (0, 255, 255),
+            "bottom_right": (0, 128, 255),
+            "bottom_left": (255, 0, 0),
+        }
+        for name, pt in selected.items():
+            if pt is None:
+                continue
+            color = draw_colors.get(name, (0, 255, 0))
+            cv2.circle(debug_img, pt, 8, color, -1)
+            cv2.putText(debug_img, name, (pt[0] + 10, pt[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+        debug_image_path = f"{debug_prefix}_corner_markers.jpg"
+        cv2.imwrite(debug_image_path, debug_img)
+
+    found_count = sum(1 for pt in selected.values() if pt is not None)
+    return {
+        "corners": selected,
+        "ordered_corners": ordered_corners,
+        "found_count": found_count,
+        "all_found": found_count == 4,
+        "candidate_count": len(candidates),
+        "debug_image_path": debug_image_path,
+    }
+
+
 def extrapolate_missing_rows(
     detection_results: Dict[str, object],
     target_rows: int = 10,
@@ -3569,6 +3907,183 @@ def _evaluate_section_fill(
     return evals
 
 
+def _build_synthetic_id_rows_from_part_i(
+    image_shape: Tuple[int, int],
+    part_i_boxes: List[np.ndarray],
+    cols: int,
+    rows: int,
+    x_range_ratio: Tuple[float, float],
+    distance_from_part_i_ratio: float,
+    row_step_ratio: float,
+) -> List[List[np.ndarray]]:
+    # Hàm hỗ trợ dựng lưới ID tổng hợp khi detect quá ít hàng.
+    h_img, w_img = int(image_shape[0]), int(image_shape[1])
+    if h_img <= 0 or w_img <= 0 or cols <= 0 or rows <= 0:
+        return []
+
+    # Neo theo mép trên Part I; nếu thiếu Part I thì dùng mốc gần đúng theo layout.
+    if part_i_boxes:
+        part_i_top = min(cv2.boundingRect(b)[1] for b in part_i_boxes)
+    else:
+        part_i_top = int(round(h_img * 0.3))
+
+    distance_ratio = float(np.clip(distance_from_part_i_ratio, 0.05, 0.60))
+    row_step_ratio = float(np.clip(row_step_ratio, 0.010, 0.080))
+
+    distance_px = max(1, int(round(distance_ratio * h_img)))
+    step_y = max(6, int(round(row_step_ratio * h_img)))
+    # Stack rows directly with no vertical gap.
+    row_h = step_y
+
+    # Tính Y hàng đầu từ khoảng cách tới Part I và chặn trong ảnh.
+    y0 = part_i_top - distance_px
+    grid_h = rows * row_h
+    y0 = min(y0, h_img - grid_h - 1)
+    y0 = max(0, y0)
+
+    xr0 = float(np.clip(x_range_ratio[0], 0.0, 0.99))
+    xr1 = float(np.clip(x_range_ratio[1], xr0 + 1e-4, 1.0))
+    x0 = int(round(xr0 * w_img))
+    x1 = int(round(xr1 * w_img))
+    if x1 <= x0:
+        x1 = min(w_img, x0 + cols)
+
+    # Build contiguous column edges so boxes touch each other horizontally.
+    x_edges = np.round(np.linspace(x0, x1, cols + 1)).astype(np.int32)
+    x_edges[0] = x0
+    x_edges[-1] = x1
+    for i in range(1, len(x_edges)):
+        min_allowed = x_edges[i - 1] + 1
+        max_allowed = x1 - (cols - i)
+        x_edges[i] = int(np.clip(x_edges[i], min_allowed, max_allowed))
+
+    out_rows: List[List[np.ndarray]] = []
+    for r in range(rows):
+        y = y0 + (r * row_h)
+        y_top = int(y)
+
+        row_boxes: List[np.ndarray] = []
+        for c in range(cols):
+            x_left = int(x_edges[c])
+            x_right = int(x_edges[c + 1])
+            box_w = max(1, x_right - x_left)
+            row_boxes.append(_rect_to_poly(x_left, y_top, box_w, row_h))
+
+        out_rows.append(row_boxes)
+
+    return out_rows
+
+
+def _build_synthetic_id_rows_fixed_image_position(
+    image_shape: Tuple[int, int],
+    cols: int,
+    rows: int,
+    x_range_ratio: Tuple[float, float],
+    top_y_ratio: float,
+    row_step_ratio: float,
+) -> List[List[np.ndarray]]:
+    # Dựng lưới ID cố định theo vị trí ảnh (không phụ thuộc Part I).
+    h_img, w_img = int(image_shape[0]), int(image_shape[1])
+    if h_img <= 0 or w_img <= 0 or cols <= 0 or rows <= 0:
+        return []
+
+    top_ratio = float(np.clip(top_y_ratio, 0.0, 0.95))
+    row_step_ratio = float(np.clip(row_step_ratio, 0.010, 0.080))
+
+    y0 = int(round(top_ratio * h_img))
+    row_h = max(6, int(round(row_step_ratio * h_img)))
+    grid_h = rows * row_h
+    y0 = min(y0, h_img - grid_h - 1)
+    y0 = max(0, y0)
+
+    xr0 = float(np.clip(x_range_ratio[0], 0.0, 0.99))
+    xr1 = float(np.clip(x_range_ratio[1], xr0 + 1e-4, 1.0))
+    x0 = int(round(xr0 * w_img))
+    x1 = int(round(xr1 * w_img))
+    if x1 <= x0:
+        x1 = min(w_img, x0 + cols)
+
+    x_edges = np.round(np.linspace(x0, x1, cols + 1)).astype(np.int32)
+    x_edges[0] = x0
+    x_edges[-1] = x1
+    for i in range(1, len(x_edges)):
+        min_allowed = x_edges[i - 1] + 1
+        max_allowed = x1 - (cols - i)
+        x_edges[i] = int(np.clip(x_edges[i], min_allowed, max_allowed))
+
+    out_rows: List[List[np.ndarray]] = []
+    for r in range(rows):
+        y_top = int(y0 + (r * row_h))
+        row_boxes: List[np.ndarray] = []
+        for c in range(cols):
+            x_left = int(x_edges[c])
+            x_right = int(x_edges[c + 1])
+            box_w = max(1, x_right - x_left)
+            row_boxes.append(_rect_to_poly(x_left, y_top, box_w, row_h))
+        out_rows.append(row_boxes)
+
+    return out_rows
+
+
+def _apply_affine_from_corner_markers(
+    image: np.ndarray,
+    corners: Dict[str, Optional[Tuple[int, int]]],
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    # Hiệu chỉnh topview từ 4 góc marker bằng perspective transform.
+    if image is None or corners is None:
+        return None, None
+
+    tl = corners.get("top_left")
+    tr = corners.get("top_right")
+    br = corners.get("bottom_right")
+    bl = corners.get("bottom_left")
+    if tl is None or tr is None or br is None or bl is None:
+        return None, None
+
+    h_img, w_img = image.shape[:2]
+    if h_img <= 0 or w_img <= 0:
+        return None, None
+
+    src = np.array(
+        [
+            [float(tl[0]), float(tl[1])],
+            [float(tr[0]), float(tr[1])],
+            [float(br[0]), float(br[1])],
+            [float(bl[0]), float(bl[1])],
+        ],
+        dtype=np.float32,
+    )
+
+    width_top = float(np.hypot(src[1, 0] - src[0, 0], src[1, 1] - src[0, 1]))
+    width_bottom = float(np.hypot(src[2, 0] - src[3, 0], src[2, 1] - src[3, 1]))
+    height_left = float(np.hypot(src[3, 0] - src[0, 0], src[3, 1] - src[0, 1]))
+    height_right = float(np.hypot(src[2, 0] - src[1, 0], src[2, 1] - src[1, 1]))
+
+    if min(width_top, width_bottom, height_left, height_right) < 20.0:
+        return None, None
+
+    # Chuẩn hóa toàn trang về topview chiếm toàn khung ảnh đầu ra.
+    dst = np.array(
+        [
+            [0.0, 0.0],
+            [float(w_img - 1), 0.0],
+            [float(w_img - 1), float(h_img - 1)],
+            [0.0, float(h_img - 1)],
+        ],
+        dtype=np.float32,
+    )
+
+    matrix = cv2.getPerspectiveTransform(src, dst)
+    warped = cv2.warpPerspective(
+        image,
+        matrix,
+        (w_img, h_img),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+    return warped, matrix
+
+
 def _demo(image_arg: Optional[str] = None) -> None:
     # Pipeline demo đầy đủ: detect, chấm, vẽ và xuất debug.
     # Chuẩn hóa tên ảnh đầu vào để hỗ trợ nhiều kiểu tham số (0015, PhieuQG.0015, ...).
@@ -3586,6 +4101,7 @@ def _demo(image_arg: Optional[str] = None) -> None:
     if img is None:
         tried = ", ".join(str(p) for p in candidate_paths)
         raise FileNotFoundError(f"Cannot read image. Tried: {tried}")
+    img_original = img.copy()
 
     def _run_detection_pipeline(src_img: np.ndarray, prefix: Optional[str]) -> Tuple[Dict[str, object], Dict[str, object]]:
         # Hàm hỗ trợ một bước xử lý trong pipeline chấm phiếu.
@@ -3636,6 +4152,16 @@ def _demo(image_arg: Optional[str] = None) -> None:
         return score
 
     debug_prefix = str(out_dir / image_path.stem)
+    corner_markers = detect_black_corner_markers(img, debug_prefix=debug_prefix)
+    print(
+        f"Corner markers: {corner_markers['found_count']}/4 "
+        f"(candidates={corner_markers['candidate_count']})"
+    )
+    if corner_markers.get("debug_image_path"):
+        print(f"Corner debug image: {corner_markers['debug_image_path']}")
+    for key in ("top_left", "top_right", "bottom_right", "bottom_left"):
+        print(f"  {key}: {corner_markers['corners'][key]}")
+
     data, parts = _run_detection_pipeline(img, debug_prefix)
 
     preprocess_mode = "base"
@@ -3703,6 +4229,219 @@ def _demo(image_arg: Optional[str] = None) -> None:
         size_tolerance_ratio=0.3,
         debug=False,
     )
+
+    # Chỉ cho phép dùng topview khi cả SBD và Mã đề đều <= ngưỡng hàng.
+    affine_retry_threshold = 4
+    topview_allowed_by_rows = (
+        sobao_danh["row_count"] <= affine_retry_threshold
+        and ma_de["row_count"] <= affine_retry_threshold
+    )
+    if topview_allowed_by_rows:
+        affine_img, affine_matrix = _apply_affine_from_corner_markers(img, corner_markers.get("corners", {}))
+        if affine_img is not None and affine_matrix is not None:
+            data_affine, parts_affine = _run_detection_pipeline(affine_img, None)
+
+            part_box_set_affine = set(id(box) for box in parts_affine["all_parts"])
+            remaining_boxes_affine = [box for box in data_affine["boxes"] if id(box) not in part_box_set_affine]
+
+            remaining_for_upper_affine = _split_merged_boxes_for_grouping(
+                remaining_boxes_affine,
+                split_wide=True,
+                split_tall=False,
+            )
+
+            sbd_candidates_affine, ma_de_candidates_affine, split_x_affine = _separate_upper_id_boxes(
+                remaining_for_upper_affine,
+                parts_affine["part_i"],
+            )
+
+            sobao_danh_affine = detect_sobao_danh_boxes(
+                sbd_candidates_affine,
+                boxes_per_row=6,
+                max_rows=10,
+                row_tolerance=30,
+                size_tolerance_ratio=0.35,
+                debug=False,
+            )
+
+            remaining_for_ma_de_affine = _split_merged_boxes_for_grouping(
+                ma_de_candidates_affine,
+                split_wide=False,
+                split_tall=True,
+            )
+            ma_de_affine = detect_ma_de_boxes(
+                remaining_for_ma_de_affine,
+                boxes_per_row=3,
+                max_rows=10,
+                row_tolerance=20,
+                size_tolerance_ratio=0.3,
+                debug=False,
+            )
+
+            old_score = int(sobao_danh["row_count"]) + int(ma_de["row_count"])
+            new_score = int(sobao_danh_affine["row_count"]) + int(ma_de_affine["row_count"])
+            if new_score > old_score:
+                img = affine_img
+                data = data_affine
+                parts = parts_affine
+                split_x = split_x_affine
+                sobao_danh = sobao_danh_affine
+                ma_de = ma_de_affine
+                preprocess_mode = f"{preprocess_mode}+topview-id"
+                print(
+                    f"[Topview] Retry improved ID detection: score {old_score} -> {new_score} "
+                    f"(SBD={sobao_danh['row_count']}, MaDe={ma_de['row_count']})"
+                )
+            else:
+                print(
+                    f"[Topview] Retry no improvement: score {old_score} -> {new_score} "
+                    f"(SBD={sobao_danh_affine['row_count']}, MaDe={ma_de_affine['row_count']})"
+                )
+        else:
+            print("[Topview] Retry skipped: not enough reliable corner markers")
+    else:
+        print(
+            "[Topview] Retry blocked by row gate: "
+            f"SBD={sobao_danh['row_count']}, MaDe={ma_de['row_count']} (>4 on at least one side)"
+        )
+
+    # Cấu hình fallback ID (không cần truyền argument CLI).
+    # Chế độ fixed sẽ đặt lưới theo vị trí tuyệt đối trên ảnh.
+    id_fallback_row_threshold = 4
+    id_grid_top_ratio = 0.072
+    id_grid_row_step_ratio = 0.0215
+    id_sbd_x_range_ratio_fixed = (0.745, 0.865)
+    id_made_x_range_ratio_fixed = (0.90, 0.96)
+
+    sbd_x_range_ratio, made_x_range_ratio = (
+        id_sbd_x_range_ratio_fixed,
+        id_made_x_range_ratio_fixed,
+    )
+
+    # Debug topview cho ID chỉ chạy khi qua row gate topview.
+    if topview_allowed_by_rows and (
+        sobao_danh["row_count"] <= id_fallback_row_threshold
+        or ma_de["row_count"] <= id_fallback_row_threshold
+    ):
+        topview_img, _ = _apply_affine_from_corner_markers(img_original, corner_markers.get("corners", {}))
+        if topview_img is not None:
+            topview_sbd_rows = _build_synthetic_id_rows_fixed_image_position(
+                image_shape=topview_img.shape[:2],
+                cols=6,
+                rows=10,
+                x_range_ratio=sbd_x_range_ratio,
+                top_y_ratio=id_grid_top_ratio,
+                row_step_ratio=id_grid_row_step_ratio,
+            )
+            topview_made_rows = _build_synthetic_id_rows_fixed_image_position(
+                image_shape=topview_img.shape[:2],
+                cols=3,
+                rows=10,
+                x_range_ratio=made_x_range_ratio,
+                top_y_ratio=id_grid_top_ratio,
+                row_step_ratio=id_grid_row_step_ratio,
+            )
+
+            gray_topview = cv2.cvtColor(topview_img, cv2.COLOR_BGR2GRAY)
+            topview_sbd_digits = evaluate_digit_rows_mean_darkness(
+                gray_topview,
+                topview_sbd_rows,
+                expected_cols=6,
+            )
+            topview_made_digits = evaluate_digit_rows_mean_darkness(
+                gray_topview,
+                topview_made_rows,
+                expected_cols=3,
+            )
+
+            print("\n=== Topview Mean-Darkness Decode ===")
+            _print_digit_darkness_summary("Topview SoBaoDanh", topview_sbd_digits)
+            _print_digit_darkness_summary("Topview MaDe", topview_made_digits)
+
+            topview_debug = topview_img.copy()
+            _draw_rows_contours(topview_debug, topview_sbd_rows, (255, 128, 0), thickness=1)
+            _draw_rows_contours(topview_debug, topview_made_rows, (255, 255, 0), thickness=1)
+
+            topview_debug = draw_digit_darkness_overlay(
+                topview_debug,
+                topview_sbd_digits,
+                color=(0, 220, 255),
+                alpha=0.40,
+            )
+            topview_debug = draw_digit_darkness_overlay(
+                topview_debug,
+                topview_made_digits,
+                color=(0, 255, 255),
+                alpha=0.40,
+            )
+
+            cv2.putText(
+                topview_debug,
+                f"Topview SBD: {topview_sbd_digits.get('decoded', '')}",
+                (30, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.9,
+                (0, 220, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                topview_debug,
+                f"Topview MaDe: {topview_made_digits.get('decoded', '')}",
+                (30, 78),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.9,
+                (0, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+
+            topview_raw_path = f"{debug_prefix}_topview.jpg"
+            topview_id_path = f"{debug_prefix}_topview_id_mean_darkness.jpg"
+            cv2.imwrite(topview_raw_path, topview_img)
+            cv2.imwrite(topview_id_path, topview_debug)
+            print(f"Topview image saved to {topview_raw_path}")
+            print(f"Topview ID debug saved to {topview_id_path}")
+        else:
+            print("Topview debug skipped: affine transform unavailable (missing reliable corners)")
+
+    fallback_threshold = max(0, int(id_fallback_row_threshold))
+    # Nếu detect quá ít hàng ID, dựng lưới tổng hợp 10 hàng theo vị trí cố định trên ảnh.
+    if sobao_danh["row_count"] <= fallback_threshold:
+        sobao_rows = _build_synthetic_id_rows_fixed_image_position(
+            image_shape=img.shape[:2],
+            cols=6,
+            rows=10,
+            x_range_ratio=sbd_x_range_ratio,
+            top_y_ratio=id_grid_top_ratio,
+            row_step_ratio=id_grid_row_step_ratio,
+        )
+        if sobao_rows:
+            sobao_danh["sobao_danh_rows"] = sobao_rows
+            sobao_danh["sobao_danh"] = [b for row in sobao_rows for b in row]
+            sobao_danh["row_count"] = len(sobao_rows)
+            print(
+                f"[Fallback] SoBaoDanh rows <= {fallback_threshold}, "
+                "drew synthetic 6x10 grid (mode=fixed)"
+            )
+
+    if ma_de["row_count"] <= fallback_threshold:
+        ma_de_rows = _build_synthetic_id_rows_fixed_image_position(
+            image_shape=img.shape[:2],
+            cols=3,
+            rows=10,
+            x_range_ratio=made_x_range_ratio,
+            top_y_ratio=id_grid_top_ratio,
+            row_step_ratio=id_grid_row_step_ratio,
+        )
+        if ma_de_rows:
+            ma_de["ma_de_rows"] = ma_de_rows
+            ma_de["ma_de"] = [b for row in ma_de_rows for b in row]
+            ma_de["row_count"] = len(ma_de_rows)
+            print(
+                f"[Fallback] MaDe rows <= {fallback_threshold}, "
+                "drew synthetic 3x10 grid (mode=fixed)"
+            )
 
     # Bù thiếu MaDe lên đủ 10 hàng bằng cách neo theo trục Y của SoBaoDanh.
     # Ý tưởng: dùng hình học cột MaDe đã phát hiện tốt để nội suy những hàng bị mất.
@@ -3772,6 +4511,8 @@ def _demo(image_arg: Optional[str] = None) -> None:
     print(f"MaDe rows: {ma_de['row_count']}")
     print(f"MaDe boxes: {len(ma_de['ma_de'])}")
     print(f"Upper split X: {split_x:.1f}")
+    print(f"SoBaoDanh rows (final): {sobao_danh['row_count']}")
+    print(f"MaDe rows (final): {ma_de['row_count']}")
     
     # Căn thẳng theo trục Y và ngoại suy để cả SBD/Mã đề đều đủ 10 hàng logic.
     combined_results = {
