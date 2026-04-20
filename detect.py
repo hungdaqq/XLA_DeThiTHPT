@@ -3,10 +3,30 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
-import itertools
 
 import cv2
 import numpy as np
+
+
+def resize_image_for_inference(
+    image: np.ndarray,
+    max_side: int = 2200,
+) -> Tuple[np.ndarray, float]:
+    # Chuẩn hóa ảnh lớn về kích thước phù hợp để giảm thời gian inference.
+    if image is None or image.size == 0:
+        return image, 1.0
+
+    h, w = image.shape[:2]
+    longest_side = max(int(h), int(w))
+    max_side = int(max(256, max_side))
+    if longest_side <= max_side:
+        return image, 1.0
+
+    scale = float(max_side) / float(longest_side)
+    new_w = max(1, int(round(float(w) * scale)))
+    new_h = max(1, int(round(float(h) * scale)))
+    resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    return resized, scale
 
 
 def _order_quad_points(points: np.ndarray) -> np.ndarray:
@@ -488,11 +508,11 @@ def _detect_single_circle_hough_in_quad(
     # Chỉ giữ gradient trong ô hiện tại để Hough không bị nhiễu bởi ô lân cận.
     masked = cv2.bitwise_and(roi, roi, mask=roi_mask)
     prep = cv2.GaussianBlur(masked, (5, 5), 0)
-    edges = cv2.Canny(prep, 40, 120)
+    edges = cv2.Canny(prep, 30, 100)
 
     # Bó bán kính quanh estimate hình học để giảm nhảy kích thước giữa các frame/ảnh.
-    min_r = max(2, int(round(est_radius * 0.80)))
-    max_r = max(min_r + 1, int(round(est_radius * 1.10)))
+    min_r = max(2, int(round(est_radius * 0.72)))
+    max_r = max(min_r + 1, int(round(est_radius * 1.22)))
     min_dist = max(4, int(round(est_radius * 2.2)))
 
     def _ring_edge_support(cx_local: float, cy_local: float, r_local: float) -> float:
@@ -548,44 +568,47 @@ def _detect_single_circle_hough_in_quad(
         return _circle_iou(ca, cb) >= 0.35
 
     candidates: List[Dict[str, float]] = []
-    for dp in (1.1, 1.2):
-        for param2 in (10, 12, 14):
-            # Quét nhẹ nhiều cặp tham số Hough để tăng độ bền trên scan khó.
-            circles = cv2.HoughCircles(
-                prep,
-                cv2.HOUGH_GRADIENT,
-                dp=dp,
-                minDist=float(min_dist),
-                param1=80,
-                param2=param2,
-                minRadius=min_r,
-                maxRadius=max_r,
+    search_pairs = ((1.1, 12), (1.2, 14), (1.1, 10), (1.2, 11), (1.3, 9))
+    for dp, param2 in search_pairs:
+        # Quét nhẹ nhiều cặp tham số Hough để tăng độ bền trên scan khó.
+        circles = cv2.HoughCircles(
+            prep,
+            cv2.HOUGH_GRADIENT,
+            dp=dp,
+            minDist=float(min_dist),
+            param1=80,
+            param2=param2,
+            minRadius=min_r,
+            maxRadius=max_r,
+        )
+        if circles is None or circles.size == 0:
+            continue
+
+        for c in circles[0][:8]:
+            cx_local = float(c[0])
+            cy_local = float(c[1])
+            rr = float(max(1.0, c[2]))
+
+            cx = cx_local + float(x)
+            cy = cy_local + float(y)
+            center_norm = float(np.hypot(cx - est_center[0], cy - est_center[1])) / float(max(1.0, est_radius))
+            radius_norm = abs(rr - float(est_radius)) / float(max(1.0, est_radius))
+            # prior_score: tin vào hình học; edge_score: tin vào tín hiệu cạnh thực.
+            prior_score = max(0.0, 1.0 - (0.70 * center_norm) - (0.60 * radius_norm))
+            edge_score = _ring_edge_support(cx_local, cy_local, rr)
+            score = (0.58 * edge_score) + (0.42 * prior_score)
+
+            candidates.append(
+                {
+                    "cx": cx,
+                    "cy": cy,
+                    "r": rr,
+                    "score": float(score),
+                }
             )
-            if circles is None or circles.size == 0:
-                continue
 
-            for c in circles[0][:8]:
-                cx_local = float(c[0])
-                cy_local = float(c[1])
-                rr = float(max(1.0, c[2]))
-
-                cx = cx_local + float(x)
-                cy = cy_local + float(y)
-                center_norm = float(np.hypot(cx - est_center[0], cy - est_center[1])) / float(max(1.0, est_radius))
-                radius_norm = abs(rr - float(est_radius)) / float(max(1.0, est_radius))
-                # prior_score: tin vào hình học; edge_score: tin vào tín hiệu cạnh thực.
-                prior_score = max(0.0, 1.0 - (0.70 * center_norm) - (0.60 * radius_norm))
-                edge_score = _ring_edge_support(cx_local, cy_local, rr)
-                score = (0.58 * edge_score) + (0.42 * prior_score)
-
-                candidates.append(
-                    {
-                        "cx": cx,
-                        "cy": cy,
-                        "r": rr,
-                        "score": float(score),
-                    }
-                )
+        if len(candidates) >= 24:
+            break
 
     if not candidates:
         return est_center, est_radius, False
@@ -782,6 +805,9 @@ def evaluate_grid_fill_from_binary(
     mask_mode: str = "quad",
     circle_radius_scale: float = 0.46,
     circle_border_exclude_ratio: float = 0.10,
+    hough_only_ambiguous: bool = True,
+    hough_ambiguity_margin: float = 0.08,
+    hough_max_cells: int = 96,
 ) -> List[Dict[str, object]]:
     # Đánh giá và trả về chỉ số/kết quả quyết định cho bước này.
     """
@@ -800,6 +826,9 @@ def evaluate_grid_fill_from_binary(
         mask_mode: Chế độ mặt nạ (`quad`/`circle`/`hough-circle`).
         circle_radius_scale: Hệ số bán kính bubble ở chế độ tròn.
         circle_border_exclude_ratio: Tỉ lệ bỏ viền ngoài bubble.
+        hough_only_ambiguous: Nếu bật, chỉ chạy Hough cho ô gần ngưỡng phân loại.
+        hough_ambiguity_margin: Biên quanh ngưỡng để coi là ô mơ hồ cần Hough.
+        hough_max_cells: Số ô tối đa được phép chạy Hough trong một lần gọi.
 
     Returns:
         Danh sách dictionary kết quả cho từng ô (box, row, col, ratio, filled, ...).
@@ -809,6 +838,8 @@ def evaluate_grid_fill_from_binary(
     # Chế độ circle/hough-circle dùng mask tròn để giảm nhiễu ở các góc của ô.
     use_circle = mode in ("circle", "hough-circle")
     use_hough_circle = mode == "hough-circle"
+    hough_calls_left = int(hough_max_cells) if int(hough_max_cells) > 0 else 0
+    ambiguity_margin = float(max(0.0, hough_ambiguity_margin))
 
     for info in grid_info:
         if "region_quad" not in info or "grid_shape" not in info:
@@ -830,27 +861,95 @@ def evaluate_grid_fill_from_binary(
             for col in cols_to_check:
                 cell_quad = _quad_cell_at(region_quad, row=row, col=col, rows=rows, cols=cols)
                 inner_quad = _shrink_quad_towards_center(cell_quad, inner_margin_ratio)
+                quad_ratio: Optional[float] = None
                 if use_circle:
                     # Ưu tiên đo trong vùng tròn để khớp hình bubble thực tế.
-                    fill_ratio, score_poly, circle_found = _fill_ratio_in_circle(
-                        binary_image,
-                        inner_quad,
-                        radius_scale=circle_radius_scale,
-                        border_exclude_ratio=circle_border_exclude_ratio,
-                        use_hough_detection=use_hough_circle,
-                    )
+                    if use_hough_circle:
+                        # Tính nhanh trước bằng circle ước lượng; chỉ Hough khi ô gần ngưỡng.
+                        base_ratio, base_poly, _ = _fill_ratio_in_circle(
+                            binary_image,
+                            inner_quad,
+                            radius_scale=circle_radius_scale,
+                            border_exclude_ratio=circle_border_exclude_ratio,
+                            use_hough_detection=False,
+                        )
+
+                        # Đo thêm trên quad để phát hiện trường hợp circle estimate bị lệch tâm
+                        # (dễ gây miss ô đã tô khi chỉ dựa vào base_ratio).
+                        quad_ratio = _fill_ratio_in_quad(binary_image, inner_quad)
+
+                        should_run_hough = True
+                        if hough_only_ambiguous:
+                            near_threshold = abs(float(base_ratio) - float(fill_ratio_thresh)) <= ambiguity_margin
+                            likely_filled_from_quad = quad_ratio >= max(
+                                float(fill_ratio_thresh) * 0.78,
+                                float(fill_ratio_thresh) - 0.14,
+                            )
+                            circle_quad_disagree = (quad_ratio - float(base_ratio)) >= 0.14
+                            weak_circle_signal = float(base_ratio) <= float(fill_ratio_thresh) * 0.65
+                            should_run_hough = bool(
+                                near_threshold
+                                or (likely_filled_from_quad and (circle_quad_disagree or weak_circle_signal))
+                            )
+                        if hough_calls_left <= 0:
+                            should_run_hough = False
+
+                        if should_run_hough:
+                            fill_ratio, score_poly, circle_found = _fill_ratio_in_circle(
+                                binary_image,
+                                inner_quad,
+                                radius_scale=circle_radius_scale,
+                                border_exclude_ratio=circle_border_exclude_ratio,
+                                use_hough_detection=True,
+                            )
+                            hough_calls_left -= 1
+                        else:
+                            # Nếu hết budget Hough nhưng quad cho tín hiệu ô tô rõ hơn,
+                            # hợp nhất nhẹ để giảm miss mà vẫn hạn chế false-positive.
+                            fused_ratio = max(
+                                float(base_ratio),
+                                min(float(quad_ratio) * 0.85, float(base_ratio) + 0.12),
+                            )
+                            fill_ratio = fused_ratio
+                            score_poly = base_poly
+                            circle_found = False
+                    else:
+                        fill_ratio, score_poly, circle_found = _fill_ratio_in_circle(
+                            binary_image,
+                            inner_quad,
+                            radius_scale=circle_radius_scale,
+                            border_exclude_ratio=circle_border_exclude_ratio,
+                            use_hough_detection=False,
+                        )
                 else:
                     # Fallback mask tứ giác khi không dùng chế độ circle/hough-circle.
                     fill_ratio = _fill_ratio_in_quad(binary_image, inner_quad)
                     score_poly = inner_quad
                     circle_found = False
+
+                effective_ratio = float(fill_ratio)
+                effective_thresh = float(fill_ratio_thresh)
+                if use_hough_circle and quad_ratio is not None:
+                    # Rescue nhẹ cho ô có tín hiệu tô rõ theo quad nhưng circle vẫn thấp.
+                    if (
+                        effective_ratio < effective_thresh
+                        and not bool(circle_found)
+                        and float(quad_ratio) >= effective_thresh * 1.02
+                        and float(base_ratio) >= effective_thresh * 0.70
+                    ):
+                        effective_ratio = max(effective_ratio, float(quad_ratio) * 0.88)
+
+                    # Khi circle chưa bắt được ổn định, nới ngưỡng một chút để giảm miss.
+                    if not bool(circle_found):
+                        effective_thresh = max(0.35, effective_thresh - 0.015)
+
                 evaluations.append(
                     {
                         "box_idx": int(info.get("box_idx", -1)),
                         "row": row,
                         "col": col,
-                        "fill_ratio": fill_ratio,
-                        "filled": fill_ratio >= float(fill_ratio_thresh),
+                        "fill_ratio": effective_ratio,
+                        "filled": effective_ratio >= effective_thresh,
                         "cell_quad": score_poly,
                         "mask_mode": "hough-circle" if use_hough_circle else ("circle" if use_circle else "quad"),
                         "circle_detected": bool(circle_found),
@@ -858,6 +957,69 @@ def evaluate_grid_fill_from_binary(
                 )
 
     return evaluations
+
+
+def suppress_false_positive_by_relative_dominance(
+    evaluations: List[Dict[str, object]],
+    group_keys: Tuple[str, str] = ("box_idx", "row"),
+    ratio_key: str = "fill_ratio",
+    min_dominant_ratio: float = 0.52,
+    min_gap: float = 0.12,
+    min_ratio_scale: float = 1.35,
+) -> List[Dict[str, object]]:
+    # Hậu xử lý theo tương quan trong cùng câu: giữ ô vượt trội, loại các ô nhiễu còn lại.
+    if not evaluations:
+        return evaluations
+
+    group_keys = tuple(group_keys)
+    if len(group_keys) < 2:
+        return evaluations
+
+    refined = [dict(item) for item in evaluations]
+    grouped_indices: Dict[Tuple[int, int], List[int]] = {}
+
+    for idx, item in enumerate(refined):
+        key_vals: List[int] = []
+        valid_key = True
+        for key in group_keys:
+            value = item.get(key, None)
+            if value is None:
+                valid_key = False
+                break
+            key_vals.append(int(value))
+        if not valid_key:
+            continue
+        grouped_indices.setdefault((key_vals[0], key_vals[1]), []).append(idx)
+
+    for indices in grouped_indices.values():
+        if len(indices) < 2:
+            continue
+
+        scored = sorted(
+            indices,
+            key=lambda i: float(refined[i].get(ratio_key, 0.0)),
+            reverse=True,
+        )
+        best_idx = scored[0]
+        second_idx = scored[1]
+        best_ratio = float(refined[best_idx].get(ratio_key, 0.0))
+        second_ratio = float(refined[second_idx].get(ratio_key, 0.0))
+
+        has_strong_abs = best_ratio >= float(min_dominant_ratio)
+        has_strong_gap = (best_ratio - second_ratio) >= float(min_gap)
+        has_scale_gap = best_ratio >= float(max(0.0, second_ratio)) * float(min_ratio_scale)
+        is_dominant = bool(has_strong_abs and has_strong_gap and has_scale_gap)
+
+        if not is_dominant or not bool(refined[best_idx].get("filled", False)):
+            continue
+
+        refined[best_idx]["dominant_choice"] = True
+        for idx in scored[1:]:
+            if bool(refined[idx].get("filled", False)):
+                refined[idx]["filled"] = False
+                refined[idx]["suppressed_by_dominance"] = True
+
+    return refined
 
 
 def draw_filled_cells_overlay(
@@ -1035,7 +1197,7 @@ def evaluate_digit_rows_mean_darkness(
     min_second_gap: float = 12.0,
     min_median_gap: float = 18.0,
     min_abs_median_gap: float = 8.0,
-    min_abs_second_gap: float = 8.0,
+    min_abs_second_gap: float = 12.0,
 ) -> Dict[str, object]:
     # Đánh giá và trả về chỉ số/kết quả quyết định cho bước này.
     """
@@ -1164,6 +1326,65 @@ def evaluate_digit_rows_mean_darkness(
     }
 
 
+def _count_filled_digit_columns(result: Dict[str, object]) -> int:
+    # Hàm hỗ trợ đếm nhanh số cột đã giải mã hợp lệ.
+    decisions = result.get("column_decisions", [])
+    if not isinstance(decisions, list):
+        return 0
+    return sum(1 for item in decisions if bool(item.get("filled", False)))
+
+
+def evaluate_digit_rows_with_binary_fallback(
+    gray_image: np.ndarray,
+    aligned_rows: List[Optional[List[np.ndarray]]],
+    expected_cols: int,
+    binary_image: Optional[np.ndarray] = None,
+) -> Dict[str, object]:
+    # Decode chính bằng ảnh xám; fallback sang binary nếu thiếu quá nhiều cột hợp lệ.
+    primary = evaluate_digit_rows_mean_darkness(
+        gray_image,
+        aligned_rows,
+        expected_cols=expected_cols,
+    )
+    primary_filled = _count_filled_digit_columns(primary)
+
+    selected = dict(primary)
+    selected["decode_source"] = "gray"
+    selected["gray_filled_cols"] = int(primary_filled)
+    selected["binary_filled_cols"] = 0
+
+    if binary_image is None or not isinstance(binary_image, np.ndarray) or binary_image.size == 0:
+        return selected
+
+    binary_gray = binary_image
+    if binary_gray.ndim == 3:
+        binary_gray = cv2.cvtColor(binary_gray, cv2.COLOR_BGR2GRAY)
+
+    # `binary` trong pipeline được tạo bằng THRESH_BINARY_INV:
+    # vùng tô đậm là pixel trắng (255). Trong khi decoder darkness chọn giá trị thấp hơn.
+    # Vì vậy cần đảo cực tính để bubble tô đậm trở thành "tối" như ảnh xám.
+    binary_for_darkness = cv2.bitwise_not(binary_gray)
+
+    binary_result = evaluate_digit_rows_mean_darkness(
+        binary_for_darkness,
+        aligned_rows,
+        expected_cols=expected_cols,
+    )
+    binary_filled = _count_filled_digit_columns(binary_result)
+
+    # Chỉ đổi sang binary khi có cải thiện thực sự để tránh ảnh hưởng mẫu vốn đang tốt.
+    use_binary = binary_filled > primary_filled
+    if use_binary:
+        selected = dict(binary_result)
+        selected["decode_source"] = "binary"
+        selected["gray_filled_cols"] = int(primary_filled)
+        selected["binary_filled_cols"] = int(binary_filled)
+    else:
+        selected["binary_filled_cols"] = int(binary_filled)
+
+    return selected
+
+
 def _print_digit_darkness_summary(title: str, result: Dict[str, object], limit: int = 20) -> None:
     # In tóm tắt nhanh để theo dõi chất lượng xử lý khi chạy.
     """
@@ -1184,13 +1405,27 @@ def _print_digit_darkness_summary(title: str, result: Dict[str, object], limit: 
         filled_cols = sum(1 for d in decisions if bool(d.get("filled", False)))
         print(f"{title} filled columns: {filled_cols}/{len(decisions)}")
     print(f"{title} decoded: {decoded}")
-    for idx, item in enumerate(evals):
-        if idx >= limit:
-            print(f"  ... and {len(evals) - limit} more")
-            break
-        print(
-            f"  col={item['col']} digit={item['row']} darkness={item['mean_darkness']:.1f}"
-        )
+    if isinstance(decisions, list) and decisions:
+        filled_decisions = [d for d in decisions if bool(d.get("filled", False))]
+        for idx, item in enumerate(filled_decisions):
+            if idx >= limit:
+                print(f"  ... and {len(filled_decisions) - limit} more")
+                break
+            print(
+                f"  col={int(item.get('col', -1))}"
+                f" digit={int(item.get('best_row', -1))}"
+                f" darkness={float(item.get('best_darkness', 255.0)):.1f}"
+                f" second_gap={float(item.get('second_gap', 0.0)):.1f}"
+                f" median_gap={float(item.get('median_gap', 0.0)):.1f}"
+            )
+    else:
+        for idx, item in enumerate(evals):
+            if idx >= limit:
+                print(f"  ... and {len(evals) - limit} more")
+                break
+            print(
+                f"  col={item['col']} digit={item['row']} darkness={item['mean_darkness']:.1f}"
+            )
 
 
 def draw_digit_darkness_overlay(
@@ -1742,7 +1977,6 @@ def detect_grid_points(
 
     return debug_data
 
-
 def _split_merged_boxes_for_grouping(
     boxes: List[np.ndarray],
     split_wide: bool = False,
@@ -1958,12 +2192,12 @@ def group_boxes_into_parts(
         best_subset: List[Dict[str, object]] = []
         best_score = float("inf")
 
-        for idx_tuple in itertools.combinations(range(len(sorted_group)), expected_count):
-            subset = [sorted_group[idx] for idx in idx_tuple]
+        def _score_subset(subset: List[Dict[str, object]]) -> float:
+            # Chấm subset theo độ đồng đều kích thước và khoảng cách cột.
             areas = [float(b["area"]) for b in subset]
             mean_area = float(np.mean(areas))
             if mean_area <= 0:
-                continue
+                return float("inf")
             size_var = max(abs(a - mean_area) / mean_area for a in areas)
 
             xs = [int(b["x"]) for b in subset]
@@ -1975,8 +2209,38 @@ def group_boxes_into_parts(
                 gap_var = float(np.std(gaps) / gap_mean) if gap_mean > 0 else 1.0
             else:
                 gap_var = 0.0
+            return float(size_var + 0.25 * gap_var)
 
-            score = size_var + 0.25 * gap_var
+        n = len(sorted_group)
+        # Với nhóm quá lớn, tránh brute-force tổ hợp toàn phần (rất chậm).
+        if n > 14:
+            # 1) Quét cửa sổ liên tiếp chuẩn.
+            for start in range(0, n - expected_count + 1):
+                subset = sorted_group[start : start + expected_count]
+                score = _score_subset(subset)
+                if score < best_score:
+                    best_score = score
+                    best_subset = subset
+
+            # 2) Quét cửa sổ lớn hơn 1 phần tử để cho phép bỏ 1 outlier.
+            window_size = expected_count + 1
+            if n >= window_size:
+                for start in range(0, n - window_size + 1):
+                    window = sorted_group[start : start + window_size]
+                    for drop_idx in range(window_size):
+                        subset = window[:drop_idx] + window[drop_idx + 1 :]
+                        score = _score_subset(subset)
+                        if score < best_score:
+                            best_score = score
+                            best_subset = subset
+            return best_subset
+
+        # Nhóm nhỏ vẫn dùng exhaustive search để giữ chất lượng chọn subset.
+        from itertools import combinations
+        for idx_tuple in combinations(range(n), expected_count):
+            subset = [sorted_group[idx] for idx in idx_tuple]
+            score = _score_subset(subset)
+
             if score < best_score:
                 best_score = score
                 best_subset = subset
@@ -2772,9 +3036,10 @@ def detect_sobao_danh_boxes(
 
     def _try_recover_merged_row(group: List[Dict[str, object]]) -> Optional[List[np.ndarray]]:
         # Hàm hỗ trợ một bước xử lý trong pipeline chấm phiếu.
-        # Recovery for rows where one merged contour combines two adjacent bubbles
-        # and the row appears as 5 boxes instead of 6.
-        if len(group) != boxes_per_row - 1:
+        # Recovery cho trường hợp một hoặc nhiều contour bị dính theo chiều ngang,
+        # khiến hàng 6 ô chỉ còn 5 hoặc 4 box.
+        missing_count = boxes_per_row - len(group)
+        if missing_count <= 0 or missing_count > 2:
             return None
 
         sorted_group = sorted(group, key=lambda b: b["x"])
@@ -2788,31 +3053,39 @@ def detect_sobao_danh_boxes(
         if median_w <= 0 or median_h <= 0:
             return None
 
-        merged_idx = int(np.argmax(widths))
-        merged_item = sorted_group[merged_idx]
-        merged_w = widths[merged_idx]
-        merged_h = heights[merged_idx]
+        splittable_indices: List[int] = []
+        for idx_item, (ww, hh) in enumerate(zip(widths, heights)):
+            # Chỉ tách contour đủ rộng và có chiều cao gần chuẩn để tránh tách nhầm nhiễu.
+            if ww >= median_w * 1.45 and (0.70 * median_h <= hh <= 1.45 * median_h):
+                splittable_indices.append(idx_item)
 
-        # Require a clearly wider contour but with comparable height.
-        if merged_w < median_w * 1.45:
-            return None
-        if not (0.75 * median_h <= merged_h <= 1.35 * median_h):
+        if len(splittable_indices) < missing_count:
             return None
 
-        mx = int(merged_item["x"])
-        my = int(merged_item["y"])
-        mh = int(merged_item["h"]) if "h" in merged_item else merged_h
-        left_w = merged_w // 2
-        right_w = merged_w - left_w
-        if left_w <= 0 or right_w <= 0:
-            return None
-
-        left_poly = _rect_to_poly(mx, my, left_w, mh)
-        right_poly = _rect_to_poly(mx + left_w, my, right_w, mh)
+        split_indices = set(
+            sorted(
+                splittable_indices,
+                key=lambda idx_item: widths[idx_item],
+                reverse=True,
+            )[:missing_count]
+        )
 
         candidate_boxes: List[np.ndarray] = []
         for i, item in enumerate(sorted_group):
-            if i == merged_idx:
+            if i in split_indices:
+                merged_w = widths[i]
+                merged_h = heights[i]
+                mx = int(item["x"])
+                my = int(item["y"])
+                mh = int(item["h"]) if "h" in item else merged_h
+
+                left_w = merged_w // 2
+                right_w = merged_w - left_w
+                if left_w <= 0 or right_w <= 0:
+                    return None
+
+                left_poly = _rect_to_poly(mx, my, left_w, mh)
+                right_poly = _rect_to_poly(mx + left_w, my, right_w, mh)
                 candidate_boxes.extend([left_poly, right_poly])
             else:
                 candidate_boxes.append(item["box"])
@@ -2834,7 +3107,7 @@ def detect_sobao_danh_boxes(
     # Find all rows with exactly boxes_per_row (6) boxes
     # Also try to extract 6-box sub-rows from larger groups
     sobao_danh_rows: List[List[np.ndarray]] = []
-    len_minus_one_groups: List[List[Dict[str, object]]] = []
+    short_groups: List[List[Dict[str, object]]] = []
     
     for idx, group in enumerate(groups):
         # Only accept rows with exactly boxes_per_row boxes and uniform size
@@ -2876,13 +3149,16 @@ def detect_sobao_danh_boxes(
 
             if debug and len(group) <= 15:
                 print(f"  ✗ Group {idx} rejected: len={len(group)} (need 6), no valid non-overlapping 6-box sub-rows")
-        elif len(group) == boxes_per_row - 1:
-            len_minus_one_groups.append(group)
+        elif boxes_per_row - 2 <= len(group) <= boxes_per_row - 1:
+            short_groups.append(group)
             recovered = _try_recover_merged_row(group)
             if recovered is not None:
                 sobao_danh_rows.append(recovered)
                 if debug:
-                    print(f"  ✓ Group {idx} recovered as SoBaoDanh row {len(sobao_danh_rows)} (split merged box)")
+                    print(
+                        f"  ✓ Group {idx} recovered as SoBaoDanh row {len(sobao_danh_rows)} "
+                        f"(split merged box, len={len(group)})"
+                    )
         elif debug and len(group) <= 10:
             areas = [b["area"] for b in group]
             mean_area = np.mean(areas) if areas else 0
@@ -2904,8 +3180,8 @@ def detect_sobao_danh_boxes(
     sobao_danh = [box for row in sobao_danh_rows for box in row]
 
     # Handle a common pattern: one unrelated header-like top row plus one valid
-    # row detected as only 5 boxes due a missing/merged contour.
-    if len(sobao_danh_rows) == max_rows and len_minus_one_groups:
+    # row detected thiếu box do contour bị dính.
+    if len(sobao_danh_rows) == max_rows and short_groups:
         row_with_y = []
         for row in sobao_danh_rows:
             ys = [cv2.boundingRect(box)[1] for box in row]
@@ -2923,7 +3199,7 @@ def detect_sobao_danh_boxes(
                 if debug:
                     print(
                         f"  • Top SBD row looks like outlier (first gap={gaps[0]:.1f}, "
-                        f"median tail gap={median_tail_gap:.1f}); attempting replacement from len-5 row"
+                        f"median tail gap={median_tail_gap:.1f}); attempting replacement from short row"
                     )
 
                 kept_rows = [row for _, row in row_with_y[1:]]
@@ -2963,7 +3239,7 @@ def detect_sobao_danh_boxes(
                         expected_y = ys_only[1] - median_tail_gap
                         best_group = None
                         best_dist = float("inf")
-                        for g in len_minus_one_groups:
+                        for g in short_groups:
                             gy = float(np.mean([int(it["y"]) for it in g])) if g else 0.0
                             dist = abs(gy - expected_y)
                             if dist < best_dist:
@@ -3005,12 +3281,12 @@ def detect_sobao_danh_boxes(
                             sobao_danh_rows = kept_rows[:max_rows]
                             sobao_danh = [box for row in sobao_danh_rows for box in row]
                             if debug:
-                                print("  ✓ Replaced top outlier SBD row using len-5 recovery")
+                                print("  ✓ Replaced top outlier SBD row using short-row recovery")
                         else:
                             sobao_danh_rows = kept_rows
                             sobao_danh = [box for row in sobao_danh_rows for box in row]
                             if debug:
-                                print("  • Dropped top outlier SBD row (no suitable len-5 replacement)")
+                                print("  • Dropped top outlier SBD row (no suitable short-row replacement)")
 
     # Normalize malformed top row where one or more boxes are abnormally wide/shifted.
     # This appears on some scans (e.g. 0003) where first-row middle boxes merge visually.
@@ -3047,12 +3323,20 @@ def detect_sobao_danh_boxes(
 
                 wide_outliers = 0
                 shifted_outliers = 0
+                severe_small_outliers = 0
                 overlap_count = 0
                 for c, (rx, ry, rw, rh) in enumerate(top_rects):
                     width_tol_hi = col_w[c] * 1.35
                     width_tol_lo = col_w[c] * 0.65
                     if rw > width_tol_hi or rw < width_tol_lo:
                         wide_outliers += 1
+
+                    # Bắt các contour bị co cụm thành chấm/vòng tròn nhỏ thay vì box bubble.
+                    severe_small_width = rw < (col_w[c] * 0.58)
+                    severe_small_height = rh < (row_h * 0.60)
+                    severe_small_area = (rw * rh) < (col_w[c] * row_h * 0.45)
+                    if severe_small_width or severe_small_height or severe_small_area:
+                        severe_small_outliers += 1
 
                     shift_tol = max(6.0, col_w[c] * 0.35)
                     if abs(rx - col_x[c]) > shift_tol:
@@ -3064,7 +3348,11 @@ def detect_sobao_danh_boxes(
                     if x0 + w0 > x1:
                         overlap_count += 1
 
-                top_row_is_malformed = (wide_outliers >= 1 and shifted_outliers >= 1) or overlap_count >= 1
+                top_row_is_malformed = (
+                    (wide_outliers >= 1 and shifted_outliers >= 1)
+                    or overlap_count >= 1
+                    or severe_small_outliers >= 1
+                )
                 if top_row_is_malformed:
                     row_y = int(round(float(np.mean([r[1] for r in top_rects]))))
                     normalized_top = [
@@ -3077,8 +3365,115 @@ def detect_sobao_danh_boxes(
                     if debug:
                         print(
                             "  ✓ Normalized top SBD row geometry "
-                            f"(wide={wide_outliers}, shifted={shifted_outliers}, overlap={overlap_count})"
+                            f"(wide={wide_outliers}, shifted={shifted_outliers}, "
+                            f"small={severe_small_outliers}, overlap={overlap_count})"
                         )
+
+    # Fallback chuyên biệt: thiếu đúng 1 hàng đầu (thường do hàng đầu bị dính contour ngang).
+    if len(sobao_danh_rows) == max_rows - 1 and len(sobao_danh_rows) >= 2:
+        row_with_y = []
+        for row in sobao_danh_rows:
+            ys = [cv2.boundingRect(box)[1] for box in row]
+            row_with_y.append((float(np.mean(ys)) if ys else 0.0, row))
+        row_with_y.sort(key=lambda t: t[0])
+
+        ys_only = [t[0] for t in row_with_y]
+        gaps = [ys_only[i + 1] - ys_only[i] for i in range(len(ys_only) - 1)]
+        median_gap = float(np.median(gaps)) if gaps else 0.0
+
+        if median_gap > 1.0:
+            expected_top_y = ys_only[0] - median_gap
+
+            valid_rows = [row for _, row in row_with_y if len(row) == boxes_per_row]
+            col_x_lists: List[List[int]] = [[] for _ in range(boxes_per_row)]
+            col_w_lists: List[List[int]] = [[] for _ in range(boxes_per_row)]
+            h_list: List[int] = []
+
+            for row in valid_rows:
+                rects = sorted([cv2.boundingRect(b) for b in row], key=lambda r: r[0])
+                if len(rects) != boxes_per_row:
+                    continue
+                for c, (rx, ry, rw, rh) in enumerate(rects):
+                    col_x_lists[c].append(int(rx))
+                    col_w_lists[c].append(int(rw))
+                    h_list.append(int(rh))
+
+            if all(col_x_lists[c] for c in range(boxes_per_row)) and h_list:
+                col_x = [int(round(float(np.median(col_x_lists[c])))) for c in range(boxes_per_row)]
+                col_w = [max(1, int(round(float(np.median(col_w_lists[c]))))) for c in range(boxes_per_row)]
+                row_h = max(1, int(round(float(np.median(h_list)))) )
+
+                best_short_group: Optional[List[Dict[str, object]]] = None
+                best_dist = float("inf")
+                top_band_limit = ys_only[0] + max(20.0, median_gap * 0.45)
+                for group in short_groups:
+                    if not group:
+                        continue
+                    gy = float(np.mean([int(it["y"]) for it in group]))
+                    if gy > top_band_limit:
+                        continue
+                    dist = abs(gy - expected_top_y)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_short_group = group
+
+                recover_tol = max(45.0, median_gap * 1.15)
+                if best_short_group is not None and best_dist <= recover_tol:
+                    assigned: List[Optional[np.ndarray]] = [None] * boxes_per_row
+                    used_cols = set()
+                    group_sorted = sorted(best_short_group, key=lambda it: int(it["x"]))
+
+                    for it in group_sorted:
+                        box = it["box"]
+                        x, y, w, h = cv2.boundingRect(box)
+                        best_col = None
+                        best_col_dist = float("inf")
+                        for c in range(boxes_per_row):
+                            if c in used_cols:
+                                continue
+                            dist = abs(x - col_x[c])
+                            if dist < best_col_dist:
+                                best_col_dist = dist
+                                best_col = c
+                        if best_col is not None:
+                            assigned[best_col] = box
+                            used_cols.add(best_col)
+
+                    row_y = int(round(float(np.mean([int(it["y"]) for it in group_sorted]))))
+                    for c in range(boxes_per_row):
+                        # Chuẩn hóa các box recover để tránh contour quá rộng chèn sang cột kế bên.
+                        if assigned[c] is None:
+                            assigned[c] = _rect_to_poly(col_x[c], row_y, col_w[c], row_h)
+                            continue
+
+                        rx, ry, rw, rh = cv2.boundingRect(assigned[c])
+                        width_ok = (0.68 * col_w[c]) <= rw <= (1.42 * col_w[c])
+                        height_ok = (0.68 * row_h) <= rh <= (1.42 * row_h)
+                        center_x = rx + (rw / 2.0)
+                        expected_center_x = col_x[c] + (col_w[c] / 2.0)
+                        center_ok = abs(center_x - expected_center_x) <= max(8.0, col_w[c] * 0.55)
+
+                        if not (width_ok and height_ok and center_ok):
+                            assigned[c] = _rect_to_poly(col_x[c], row_y, col_w[c], row_h)
+
+                    # Đảm bảo các cột trái -> phải không đè nhau do sai hình học cục bộ.
+                    for c in range(boxes_per_row - 1):
+                        x0, y0, w0, h0 = cv2.boundingRect(assigned[c])
+                        x1, y1, w1, h1 = cv2.boundingRect(assigned[c + 1])
+                        if x0 + w0 > x1:
+                            assigned[c] = _rect_to_poly(col_x[c], row_y, col_w[c], row_h)
+                            assigned[c + 1] = _rect_to_poly(col_x[c + 1], row_y, col_w[c + 1], row_h)
+
+                    recovered_top = [box for box in assigned if box is not None]
+                    if len(recovered_top) == boxes_per_row:
+                        sobao_danh_rows = [recovered_top] + [row for _, row in row_with_y]
+                        sobao_danh_rows = sobao_danh_rows[:max_rows]
+                        sobao_danh = [box for row in sobao_danh_rows for box in row]
+                        if debug:
+                            print(
+                                "  ✓ Recovered missing top SBD row from short top group "
+                                f"(gap~{median_gap:.1f}, y={row_y}, short_len={len(best_short_group)})"
+                            )
     
     return {
         "sobao_danh": sobao_danh,
@@ -3197,6 +3592,34 @@ def detect_ma_de_boxes(
     }
 
 
+def build_fill_scoring_binary(
+    image: np.ndarray,
+    block_size: int = 31,
+    block_offset: int = 9,
+) -> np.ndarray:
+    # Dựng binary riêng cho bước chấm tô để giảm hiện tượng nét trắng "nở" quá dày.
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image.copy()
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+
+    if block_size % 2 == 0:
+        block_size += 1
+    block_size = max(3, int(block_size))
+
+    binary_score = cv2.adaptiveThreshold(
+        blur,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        block_size,
+        int(block_offset),
+    )
+
+    # Opening nhẹ để làm mảnh biên trắng và loại hạt nhiễu nhỏ.
+    open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+    binary_score = cv2.morphologyEx(binary_score, cv2.MORPH_OPEN, open_kernel, iterations=1)
+    return binary_score
+
+
 def detect_boxes_from_morph_lines(
     image: np.ndarray,
     vertical_scale: float = 0.015,
@@ -3310,6 +3733,11 @@ def detect_boxes_from_morph_lines(
 
     result = {
         "binary": grid["binary"],
+        "binary_score": build_fill_scoring_binary(
+            image,
+            block_size=max(21, int(block_size) - 4),
+            block_offset=int(block_offset) + 2,
+        ),
         "vertical": vertical,
         "horizontal": horizontal,
         "lines": lines,
@@ -3320,9 +3748,9 @@ def detect_boxes_from_morph_lines(
     }
 
     if debug_prefix:
-        cv2.imwrite(f"{debug_prefix}_vertical.jpg", vertical)
-        cv2.imwrite(f"{debug_prefix}_horizontal.jpg", horizontal)
-        cv2.imwrite(f"{debug_prefix}_lines.jpg", lines)
+        # cv2.imwrite(f"{debug_prefix}_vertical.jpg", vertical)
+        # cv2.imwrite(f"{debug_prefix}_horizontal.jpg", horizontal)
+        # cv2.imwrite(f"{debug_prefix}_lines.jpg", lines)
         # cv2.imwrite(f"{debug_prefix}_lines_closed.jpg", lines_closed)
         # cv2.imwrite(f"{debug_prefix}_enclosed.jpg", enclosed)
         cv2.imwrite(f"{debug_prefix}_boxes.jpg", overlay)
@@ -3596,6 +4024,90 @@ def detect_black_corner_markers(
     if tl is None and tr is not None and bl is not None:
         selected["top_left"] = (int(bl[0]), int(tr[1]))
 
+    # Sửa corner outlier khi đã đủ 4 góc nhưng một góc lệch mạnh so với hình học cạnh.
+    if all(selected[name] is not None for name in ("top_left", "top_right", "bottom_right", "bottom_left")):
+        def _corner_dist_ratio(name: str, pt: Tuple[int, int]) -> float:
+            target = corner_targets[name]
+            return float(np.hypot(float(pt[0]) - target[0], float(pt[1]) - target[1])) / max(diag, 1.0)
+
+        def _clip_point(x: int, y: int) -> Tuple[int, int]:
+            return (
+                int(np.clip(x, 0, w_img - 1)),
+                int(np.clip(y, 0, h_img - 1)),
+            )
+
+        # Dung sai hình học theo kích thước ảnh để không quá nhạy với góc chụp nghiêng nhẹ.
+        y_edge_tol = max(22, int(round(0.06 * h_img)))
+        x_edge_tol = max(18, int(round(0.06 * w_img)))
+
+        tl_pt = selected["top_left"]
+        tr_pt = selected["top_right"]
+        br_pt = selected["bottom_right"]
+        bl_pt = selected["bottom_left"]
+
+        dist = {
+            "top_left": _corner_dist_ratio("top_left", tl_pt),
+            "top_right": _corner_dist_ratio("top_right", tr_pt),
+            "bottom_right": _corner_dist_ratio("bottom_right", br_pt),
+            "bottom_left": _corner_dist_ratio("bottom_left", bl_pt),
+        }
+
+        def _is_corner_outlier(name: str, peer: str) -> bool:
+            return dist[name] > max(0.09, dist[peer] * 1.8)
+
+        top_y_delta = abs(int(tl_pt[1]) - int(tr_pt[1]))
+        bottom_y_delta = abs(int(bl_pt[1]) - int(br_pt[1]))
+        left_x_delta = abs(int(tl_pt[0]) - int(bl_pt[0]))
+        right_x_delta = abs(int(tr_pt[0]) - int(br_pt[0]))
+
+        if top_y_delta > y_edge_tol:
+            if _is_corner_outlier("top_left", "top_right"):
+                selected["top_left"] = _clip_point(int(bl_pt[0]), int(tr_pt[1]))
+                selected_bboxes["top_left"] = None
+            elif _is_corner_outlier("top_right", "top_left"):
+                selected["top_right"] = _clip_point(int(br_pt[0]), int(tl_pt[1]))
+                selected_bboxes["top_right"] = None
+
+        # Re-read points after possible top-edge correction.
+        tl_pt = selected["top_left"]
+        tr_pt = selected["top_right"]
+        br_pt = selected["bottom_right"]
+        bl_pt = selected["bottom_left"]
+
+        if bottom_y_delta > y_edge_tol:
+            if _is_corner_outlier("bottom_left", "bottom_right"):
+                selected["bottom_left"] = _clip_point(int(tl_pt[0]), int(br_pt[1]))
+                selected_bboxes["bottom_left"] = None
+            elif _is_corner_outlier("bottom_right", "bottom_left"):
+                selected["bottom_right"] = _clip_point(int(tr_pt[0]), int(bl_pt[1]))
+                selected_bboxes["bottom_right"] = None
+
+        tl_pt = selected["top_left"]
+        tr_pt = selected["top_right"]
+        br_pt = selected["bottom_right"]
+        bl_pt = selected["bottom_left"]
+
+        if left_x_delta > x_edge_tol:
+            if _is_corner_outlier("top_left", "bottom_left"):
+                selected["top_left"] = _clip_point(int(bl_pt[0]), int(tr_pt[1]))
+                selected_bboxes["top_left"] = None
+            elif _is_corner_outlier("bottom_left", "top_left"):
+                selected["bottom_left"] = _clip_point(int(tl_pt[0]), int(br_pt[1]))
+                selected_bboxes["bottom_left"] = None
+
+        tl_pt = selected["top_left"]
+        tr_pt = selected["top_right"]
+        br_pt = selected["bottom_right"]
+        bl_pt = selected["bottom_left"]
+
+        if right_x_delta > x_edge_tol:
+            if _is_corner_outlier("top_right", "bottom_right"):
+                selected["top_right"] = _clip_point(int(br_pt[0]), int(tl_pt[1]))
+                selected_bboxes["top_right"] = None
+            elif _is_corner_outlier("bottom_right", "top_right"):
+                selected["bottom_right"] = _clip_point(int(tr_pt[0]), int(bl_pt[1]))
+                selected_bboxes["bottom_right"] = None
+
     ordered_corners: List[Tuple[int, int]] = []
     for name in ("top_left", "top_right", "bottom_right", "bottom_left"):
         pt = selected[name]
@@ -3639,6 +4151,8 @@ def detect_black_corner_markers(
 def extrapolate_missing_rows(
     detection_results: Dict[str, object],
     target_rows: int = 10,
+    expected_top_y: Optional[int] = None,
+    expected_row_step: Optional[int] = None,
     debug: bool = False,
 ) -> Dict[str, object]:
     # Nội suy/ngoại suy dữ liệu thiếu dựa trên mốc tham chiếu.
@@ -3674,46 +4188,83 @@ def extrapolate_missing_rows(
             avg_y = y_sum // len(row)
             ma_de_y_positions.append(avg_y)
     
+    sobao_is_synthetic = bool(detection_results.get("sobao_is_synthetic", False))
+    ma_de_is_synthetic = bool(detection_results.get("ma_de_is_synthetic", False))
+
     if debug:
         print(f"\n[DEBUG] SoBaoDanh Y positions: {sobao_y_positions}")
         print(f"[DEBUG] MaDe Y positions: {ma_de_y_positions}")
+        print(f"[DEBUG] SoBaoDanh synthetic: {sobao_is_synthetic}")
+        print(f"[DEBUG] MaDe synthetic: {ma_de_is_synthetic}")
     
     # Use SoBaoDanh Y positions as reference (since it has all 10 rows detected)
     # If SoBaoDanh has 10 rows, use them directly
-    if len(sobao_y_positions) == target_rows:
+    if len(sobao_y_positions) == target_rows and not sobao_is_synthetic:
         reference_positions = sobao_y_positions
         if debug:
             print(f"[DEBUG] Using SoBaoDanh Y positions directly: {reference_positions}")
     else:
         # If SoBaoDanh doesn't have all rows, calculate expected positions
         # Calculate average row spacing from the section with more rows
-        spacing_positions = sobao_y_positions if len(sobao_y_positions) >= len(ma_de_y_positions) else ma_de_y_positions
+        if sobao_is_synthetic and not ma_de_is_synthetic and ma_de_y_positions:
+            spacing_positions = ma_de_y_positions
+        elif ma_de_is_synthetic and not sobao_is_synthetic and sobao_y_positions:
+            spacing_positions = sobao_y_positions
+        else:
+            spacing_positions = sobao_y_positions if len(sobao_y_positions) >= len(ma_de_y_positions) else ma_de_y_positions
         
         if len(spacing_positions) >= 2:
             spacings = [spacing_positions[i + 1] - spacing_positions[i] for i in range(len(spacing_positions) - 1)]
-            avg_spacing = int(np.mean(spacings)) if spacings else 0
+            avg_spacing = int(round(float(np.median(spacings)))) if spacings else 0
+        elif expected_row_step is not None and int(expected_row_step) > 0:
+            avg_spacing = int(expected_row_step)
         else:
             avg_spacing = 0
         
         if spacing_positions:
-            first_row_y = spacing_positions[0]
-            reference_positions = [first_row_y + i * avg_spacing for i in range(target_rows)]
+            first_detected_y = int(spacing_positions[0])
+            first_row_y = first_detected_y
+
+            if avg_spacing > 0 and expected_top_y is not None:
+                expected_top = int(expected_top_y)
+                best_offset = 0
+                best_score = float("inf")
+                for offset in range(target_rows):
+                    candidate_top = first_detected_y - (offset * avg_spacing)
+                    score = abs(candidate_top - expected_top)
+                    if score < best_score:
+                        best_score = score
+                        best_offset = offset
+                first_row_y = first_detected_y - (best_offset * avg_spacing)
+
+                clamp_margin = max(30, int(round(avg_spacing * 2.0)))
+                first_row_y = int(np.clip(first_row_y, expected_top - clamp_margin, expected_top + clamp_margin))
+
+            if avg_spacing > 0:
+                reference_positions = [first_row_y + i * avg_spacing for i in range(target_rows)]
+            else:
+                reference_positions = [first_row_y for _ in range(target_rows)]
             if debug:
                 print(f"[DEBUG] Calculated reference positions: {reference_positions}")
         else:
-            # No reference rows available: return a complete empty-aligned structure
-            # so downstream callers can still read summary keys safely.
-            result = detection_results.copy()
-            result["sobao_danh_rows_aligned"] = [None] * target_rows
-            result["ma_de_rows_aligned"] = [None] * target_rows
-            result["reference_positions"] = []
-            result["sobao_y_positions"] = sobao_y_positions
-            result["ma_de_y_positions"] = ma_de_y_positions
-            result["sobao_missing_count"] = target_rows
-            result["ma_de_missing_count"] = target_rows
-            result["sobao_detected_count"] = 0
-            result["ma_de_detected_count"] = 0
-            return result
+            if expected_top_y is not None and expected_row_step is not None and int(expected_row_step) > 0:
+                y0 = int(expected_top_y)
+                step = int(expected_row_step)
+                reference_positions = [y0 + i * step for i in range(target_rows)]
+            else:
+                # No reference rows available: return a complete empty-aligned structure
+                # so downstream callers can still read summary keys safely.
+                result = detection_results.copy()
+                result["sobao_danh_rows_aligned"] = [None] * target_rows
+                result["ma_de_rows_aligned"] = [None] * target_rows
+                result["reference_positions"] = []
+                result["sobao_y_positions"] = sobao_y_positions
+                result["ma_de_y_positions"] = ma_de_y_positions
+                result["sobao_missing_count"] = target_rows
+                result["ma_de_missing_count"] = target_rows
+                result["sobao_detected_count"] = 0
+                result["ma_de_detected_count"] = 0
+                return result
     
     # Map detected MaDe rows to SoBaoDanh Y positions
     def align_rows_to_reference_positions(detected_rows, detected_y_positions, reference_positions, name="", tolerance=20):
@@ -3751,10 +4302,19 @@ def extrapolate_missing_rows(
         return aligned
     
     # Align both SoBaoDanh and MaDe rows to reference positions
+    sobao_tolerance = 30
+    ma_de_tolerance = 90
+    if expected_row_step is not None and int(expected_row_step) > 0:
+        base_tol = int(round(float(expected_row_step) * 2.2))
+        if sobao_is_synthetic:
+            sobao_tolerance = max(sobao_tolerance, base_tol)
+        if ma_de_is_synthetic:
+            ma_de_tolerance = max(ma_de_tolerance, base_tol)
+
     aligned_sobao = align_rows_to_reference_positions(
-        sobao_danh_rows, sobao_y_positions, reference_positions, "SoBaoDanh", tolerance=30)
+        sobao_danh_rows, sobao_y_positions, reference_positions, "SoBaoDanh", tolerance=sobao_tolerance)
     aligned_ma_de = align_rows_to_reference_positions(
-        ma_de_rows, ma_de_y_positions, reference_positions, "MaDe", tolerance=90)
+        ma_de_rows, ma_de_y_positions, reference_positions, "MaDe", tolerance=ma_de_tolerance)
     
     # Create result with aligned/extrapolated rows
     result = detection_results.copy()
@@ -3798,7 +4358,7 @@ def _normalize_image_stem(image_arg: Optional[str]) -> str:
 
     token = Path(raw).name
     token_lower = token.lower()
-    if token_lower.endswith((".jpg", ".jpeg", ".png")):
+    if token_lower.endswith((".jpg", ".jpeg", ".png", ".bmp", ".tiff")):
         token = Path(token).stem
 
     if token.startswith("PhieuQG."):
@@ -3894,6 +4454,26 @@ def _evaluate_section_fill(
     if binary_threshold is None or not grid_info:
         return []
 
+    total_cells = 0
+    for info in grid_info:
+        rows, cols = info.get("grid_shape", (0, 0))
+        rows = int(rows)
+        cols = int(cols)
+        pattern = info.get("pattern")
+
+        if isinstance(pattern, list) and rows > 0 and cols > 0:
+            count = 0
+            for r in range(rows):
+                if r < len(pattern) and isinstance(pattern[r], list):
+                    count += len([c for c in pattern[r] if 0 <= int(c) < cols])
+                else:
+                    count += cols
+            total_cells += count
+        else:
+            total_cells += max(0, rows * cols)
+
+    hough_budget = max(64, min(220, int(round(total_cells * 0.45))))
+
     evals = evaluate_grid_fill_from_binary(
         binary_image=binary_threshold,
         grid_info=grid_info,
@@ -3902,6 +4482,9 @@ def _evaluate_section_fill(
         mask_mode="hough-circle",
         circle_radius_scale=circle_radius_scale,
         circle_border_exclude_ratio=circle_border_exclude_ratio,
+        hough_only_ambiguous=True,
+        hough_ambiguity_margin=0.10,
+        hough_max_cells=hough_budget,
     )
     _print_fill_summary(section_name, evals)
     return evals
@@ -4025,6 +4608,59 @@ def _build_synthetic_id_rows_fixed_image_position(
     return out_rows
 
 
+def _build_synthetic_id_rows_from_reference_positions(
+    image_shape: Tuple[int, int],
+    cols: int,
+    x_range_ratio: Tuple[float, float],
+    reference_positions: List[int],
+    row_height: Optional[int] = None,
+) -> List[List[np.ndarray]]:
+    # Dựng lưới ID tổng hợp với trục Y neo theo các vị trí tham chiếu đã biết.
+    h_img, w_img = int(image_shape[0]), int(image_shape[1])
+    if h_img <= 0 or w_img <= 0 or cols <= 0 or not reference_positions:
+        return []
+
+    ref = [int(y) for y in reference_positions]
+    ref.sort()
+
+    if row_height is None or int(row_height) <= 0:
+        if len(ref) >= 2:
+            diffs = [max(1, ref[i + 1] - ref[i]) for i in range(len(ref) - 1)]
+            row_h = int(round(float(np.median(diffs))))
+        else:
+            row_h = max(6, int(round(0.018 * h_img)))
+    else:
+        row_h = max(1, int(row_height))
+
+    xr0 = float(np.clip(x_range_ratio[0], 0.0, 0.99))
+    xr1 = float(np.clip(x_range_ratio[1], xr0 + 1e-4, 1.0))
+    x0 = int(round(xr0 * w_img))
+    x1 = int(round(xr1 * w_img))
+    if x1 <= x0:
+        x1 = min(w_img, x0 + cols)
+
+    x_edges = np.round(np.linspace(x0, x1, cols + 1)).astype(np.int32)
+    x_edges[0] = x0
+    x_edges[-1] = x1
+    for i in range(1, len(x_edges)):
+        min_allowed = x_edges[i - 1] + 1
+        max_allowed = x1 - (cols - i)
+        x_edges[i] = int(np.clip(x_edges[i], min_allowed, max_allowed))
+
+    out_rows: List[List[np.ndarray]] = []
+    for y_ref in ref:
+        y_top = int(np.clip(y_ref, 0, max(0, h_img - row_h - 1)))
+        row_boxes: List[np.ndarray] = []
+        for c in range(cols):
+            x_left = int(x_edges[c])
+            x_right = int(x_edges[c + 1])
+            box_w = max(1, x_right - x_left)
+            row_boxes.append(_rect_to_poly(x_left, y_top, box_w, row_h))
+        out_rows.append(row_boxes)
+
+    return out_rows
+
+
 def _apply_affine_from_corner_markers(
     image: np.ndarray,
     corners: Dict[str, Optional[Tuple[int, int]]],
@@ -4084,7 +4720,7 @@ def _apply_affine_from_corner_markers(
     return warped, matrix
 
 
-def _demo(image_arg: Optional[str] = None) -> None:
+def _demo(image_arg: Optional[str] = None, topview_debug: bool = False) -> None:
     # Pipeline demo đầy đủ: detect, chấm, vẽ và xuất debug.
     # Chuẩn hóa tên ảnh đầu vào để hỗ trợ nhiều kiểu tham số (0015, PhieuQG.0015, ...).
     base_image_name = _normalize_image_stem(image_arg)
@@ -4092,6 +4728,8 @@ def _demo(image_arg: Optional[str] = None) -> None:
         Path("PhieuQG") / f"{base_image_name}.jpg",
         Path("PhieuQG") / f"{base_image_name}.jpeg",
         Path("PhieuQG") / f"{base_image_name}.png",
+        Path("PhieuQG") / f"{base_image_name}.BMP",
+        Path("PhieuQG") / f"{base_image_name}.tiff",
     ]
     image_path = next((p for p in candidate_paths if p.exists()), candidate_paths[0])
     out_dir = Path("output/detection")
@@ -4101,6 +4739,15 @@ def _demo(image_arg: Optional[str] = None) -> None:
     if img is None:
         tried = ", ".join(str(p) for p in candidate_paths)
         raise FileNotFoundError(f"Cannot read image. Tried: {tried}")
+
+    orig_h, orig_w = img.shape[:2]
+    img, resize_scale = resize_image_for_inference(img, max_side=2200)
+    if resize_scale < 0.9999:
+        resized_h, resized_w = img.shape[:2]
+        print(
+            f"[Resize] {orig_w}x{orig_h} -> {resized_w}x{resized_h} "
+            f"(scale={resize_scale:.3f})"
+        )
     img_original = img.copy()
 
     def _run_detection_pipeline(src_img: np.ndarray, prefix: Optional[str]) -> Tuple[Dict[str, object], Dict[str, object]]:
@@ -4165,6 +4812,7 @@ def _demo(image_arg: Optional[str] = None) -> None:
     data, parts = _run_detection_pipeline(img, debug_prefix)
 
     preprocess_mode = "base"
+    topview_applied = False
     page_h = img.shape[0] if img is not None else 0
 
     # Fallback cho ảnh khó: thử CLAHE rồi chọn kết quả có điểm bố cục tốt hơn.
@@ -4203,6 +4851,8 @@ def _demo(image_arg: Optional[str] = None) -> None:
         remaining_for_upper,
         parts["part_i"],
     )
+    active_sbd_candidates = sbd_candidates
+    active_ma_de_candidates = ma_de_candidates
 
     sobao_danh = detect_sobao_danh_boxes(
         sbd_candidates,
@@ -4230,11 +4880,61 @@ def _demo(image_arg: Optional[str] = None) -> None:
         debug=False,
     )
 
-    # Chỉ cho phép dùng topview khi cả SBD và Mã đề đều <= ngưỡng hàng.
+    def _evaluate_id_decode_quality(
+        src_img: np.ndarray,
+        data_local: Dict[str, object],
+        sbd_rows: List[List[np.ndarray]],
+        ma_de_rows: List[List[np.ndarray]],
+    ) -> Dict[str, int]:
+        # Chấm nhanh chất lượng ID: số cột có bubble hợp lệ sau decoder.
+        gray_local = cv2.cvtColor(src_img, cv2.COLOR_BGR2GRAY)
+        binary_local = data_local.get("binary")
+
+        if sbd_rows:
+            sbd_eval_local = evaluate_digit_rows_with_binary_fallback(
+                gray_local,
+                sbd_rows,
+                expected_cols=6,
+                binary_image=binary_local,
+            )
+            sbd_filled_local = int(_count_filled_digit_columns(sbd_eval_local))
+        else:
+            sbd_filled_local = 0
+
+        if ma_de_rows:
+            ma_de_eval_local = evaluate_digit_rows_with_binary_fallback(
+                gray_local,
+                ma_de_rows,
+                expected_cols=3,
+                binary_image=binary_local,
+            )
+            ma_de_filled_local = int(_count_filled_digit_columns(ma_de_eval_local))
+        else:
+            ma_de_filled_local = 0
+
+        return {
+            "sbd_filled": sbd_filled_local,
+            "ma_de_filled": ma_de_filled_local,
+        }
+
+    base_id_quality = _evaluate_id_decode_quality(
+        img,
+        data,
+        sobao_danh["sobao_danh_rows"],
+        ma_de["ma_de_rows"],
+    )
+    current_id_quality = dict(base_id_quality)
+
+    # Cho phép dùng topview khi một trong hai vùng ID bị thiếu hàng rõ rệt.
     affine_retry_threshold = 4
+    no_valid_id_parts = (
+        int(base_id_quality.get("sbd_filled", 0)) == 0
+        and int(base_id_quality.get("ma_de_filled", 0)) == 0
+    )
     topview_allowed_by_rows = (
         sobao_danh["row_count"] <= affine_retry_threshold
-        and ma_de["row_count"] <= affine_retry_threshold
+        or ma_de["row_count"] <= affine_retry_threshold
+        or no_valid_id_parts
     )
     if topview_allowed_by_rows:
         affine_img, affine_matrix = _apply_affine_from_corner_markers(img, corner_markers.get("corners", {}))
@@ -4278,23 +4978,111 @@ def _demo(image_arg: Optional[str] = None) -> None:
                 debug=False,
             )
 
+            affine_id_quality = _evaluate_id_decode_quality(
+                affine_img,
+                data_affine,
+                sobao_danh_affine["sobao_danh_rows"],
+                ma_de_affine["ma_de_rows"],
+            )
+
             old_score = int(sobao_danh["row_count"]) + int(ma_de["row_count"])
             new_score = int(sobao_danh_affine["row_count"]) + int(ma_de_affine["row_count"])
-            if new_score > old_score:
+            old_quality_score = int(base_id_quality.get("sbd_filled", 0)) + int(base_id_quality.get("ma_de_filled", 0))
+            new_quality_score = int(affine_id_quality.get("sbd_filled", 0)) + int(affine_id_quality.get("ma_de_filled", 0))
+
+            base_sbd_filled = int(base_id_quality.get("sbd_filled", 0))
+            base_ma_de_filled = int(base_id_quality.get("ma_de_filled", 0))
+            affine_sbd_filled = int(affine_id_quality.get("sbd_filled", 0))
+            affine_ma_de_filled = int(affine_id_quality.get("ma_de_filled", 0))
+
+            force_topview_for_missing_id_parts = (
+                int(sobao_danh["row_count"]) == 0 and int(ma_de["row_count"]) == 0
+            )
+            force_topview_for_invalid_id_parts = (
+                no_valid_id_parts and new_quality_score >= old_quality_score
+            )
+            force_topview_for_single_invalid_side = (
+                (base_sbd_filled == 0 and affine_sbd_filled > base_sbd_filled)
+                or (base_ma_de_filled == 0 and affine_ma_de_filled > base_ma_de_filled)
+            )
+
+            # Guard: không áp topview nếu làm tụt mạnh Part II/III đang detect tốt ở ảnh gốc.
+            base_part_ii_count = len(parts.get("part_ii", []))
+            base_part_iii_count = len(parts.get("part_iii", []))
+            affine_part_ii_count = len(parts_affine.get("part_ii", []))
+            affine_part_iii_count = len(parts_affine.get("part_iii", []))
+
+            topview_preserves_sections = True
+            section_guard_reasons: List[str] = []
+
+            if base_part_ii_count >= 6:
+                min_part_ii_after = max(4, int(round(0.70 * float(base_part_ii_count))))
+                if affine_part_ii_count < min_part_ii_after:
+                    topview_preserves_sections = False
+                    section_guard_reasons.append(
+                        f"PartII {base_part_ii_count}->{affine_part_ii_count}"
+                    )
+
+            if base_part_iii_count >= 5:
+                min_part_iii_after = max(4, int(round(0.70 * float(base_part_iii_count))))
+                if affine_part_iii_count < min_part_iii_after:
+                    topview_preserves_sections = False
+                    section_guard_reasons.append(
+                        f"PartIII {base_part_iii_count}->{affine_part_iii_count}"
+                    )
+
+            topview_candidate_improved = (
+                new_score > old_score
+                or new_quality_score > old_quality_score
+                or force_topview_for_missing_id_parts
+                or force_topview_for_invalid_id_parts
+                or force_topview_for_single_invalid_side
+            )
+
+            if topview_candidate_improved and topview_preserves_sections:
                 img = affine_img
                 data = data_affine
                 parts = parts_affine
                 split_x = split_x_affine
                 sobao_danh = sobao_danh_affine
                 ma_de = ma_de_affine
+                active_sbd_candidates = sbd_candidates_affine
+                active_ma_de_candidates = ma_de_candidates_affine
+                current_id_quality = dict(affine_id_quality)
                 preprocess_mode = f"{preprocess_mode}+topview-id"
+                topview_applied = True
+                if new_score > old_score or new_quality_score > old_quality_score:
+                    print(
+                        f"[Topview] Retry improved ID detection: score {old_score} -> {new_score}, "
+                        f"filled {old_quality_score} -> {new_quality_score} "
+                        f"(SBD={sobao_danh['row_count']}, MaDe={ma_de['row_count']})"
+                    )
+                elif force_topview_for_missing_id_parts:
+                    print(
+                        f"[Topview] Forced for missing ID parts: score {old_score} -> {new_score} "
+                        f"(SBD={sobao_danh['row_count']}, MaDe={ma_de['row_count']})"
+                    )
+                elif force_topview_for_single_invalid_side:
+                    print(
+                        f"[Topview] Forced for single-side invalid ID quality: score {old_score} -> {new_score}, "
+                        f"filled {old_quality_score} -> {new_quality_score} "
+                        f"(SBD={sobao_danh['row_count']}, MaDe={ma_de['row_count']})"
+                    )
+                else:
+                    print(
+                        f"[Topview] Forced for invalid ID quality: score {old_score} -> {new_score}, "
+                        f"filled {old_quality_score} -> {new_quality_score} "
+                        f"(SBD={sobao_danh['row_count']}, MaDe={ma_de['row_count']})"
+                    )
+            elif topview_candidate_improved and not topview_preserves_sections:
                 print(
-                    f"[Topview] Retry improved ID detection: score {old_score} -> {new_score} "
-                    f"(SBD={sobao_danh['row_count']}, MaDe={ma_de['row_count']})"
+                    "[Topview] Retry blocked by section guard: "
+                    + ", ".join(section_guard_reasons)
                 )
             else:
                 print(
-                    f"[Topview] Retry no improvement: score {old_score} -> {new_score} "
+                    f"[Topview] Retry no improvement: score {old_score} -> {new_score}, "
+                    f"filled {old_quality_score} -> {new_quality_score} "
                     f"(SBD={sobao_danh_affine['row_count']}, MaDe={ma_de_affine['row_count']})"
                 )
         else:
@@ -4302,15 +5090,15 @@ def _demo(image_arg: Optional[str] = None) -> None:
     else:
         print(
             "[Topview] Retry blocked by row gate: "
-            f"SBD={sobao_danh['row_count']}, MaDe={ma_de['row_count']} (>4 on at least one side)"
+            f"SBD={sobao_danh['row_count']}, MaDe={ma_de['row_count']} (>4 on both sides)"
         )
 
     # Cấu hình fallback ID (không cần truyền argument CLI).
     # Chế độ fixed sẽ đặt lưới theo vị trí tuyệt đối trên ảnh.
     id_fallback_row_threshold = 4
-    id_grid_top_ratio = 0.072
-    id_grid_row_step_ratio = 0.0215
-    id_sbd_x_range_ratio_fixed = (0.745, 0.865)
+    id_grid_top_ratio = 0.0725
+    id_grid_row_step_ratio = 0.0211
+    id_sbd_x_range_ratio_fixed = (0.74, 0.865)
     id_made_x_range_ratio_fixed = (0.90, 0.96)
 
     sbd_x_range_ratio, made_x_range_ratio = (
@@ -4318,8 +5106,102 @@ def _demo(image_arg: Optional[str] = None) -> None:
         id_made_x_range_ratio_fixed,
     )
 
-    # Debug topview cho ID chỉ chạy khi qua row gate topview.
-    if topview_allowed_by_rows and (
+    sobao_rows_are_synthetic = False
+    ma_de_rows_are_synthetic = False
+
+    def _estimate_reference_positions_from_rows(rows: List[List[np.ndarray]], target_rows: int = 10) -> List[int]:
+        # Suy ra 10 mốc Y từ các hàng detect được và neo gần vị trí top mặc định.
+        if not rows:
+            return []
+
+        y_positions = []
+        for row in rows:
+            if not row:
+                continue
+            ys = [cv2.boundingRect(box)[1] for box in row]
+            y_positions.append(int(round(float(np.mean(ys)))))
+
+        if not y_positions:
+            return []
+
+        y_positions = sorted(y_positions)
+        expected_top = int(round(float(id_grid_top_ratio) * float(img.shape[0])))
+        expected_step = max(6, int(round(float(id_grid_row_step_ratio) * float(img.shape[0]))))
+
+        if len(y_positions) >= 2:
+            diffs = [max(1, y_positions[i + 1] - y_positions[i]) for i in range(len(y_positions) - 1)]
+            step = int(round(float(np.median(diffs))))
+        else:
+            step = int(expected_step)
+        step = max(1, step)
+
+        first_detected = int(y_positions[0])
+        best_offset = 0
+        best_score = float("inf")
+        for offset in range(target_rows):
+            candidate_top = first_detected - (offset * step)
+            score = abs(candidate_top - expected_top)
+            if score < best_score:
+                best_score = score
+                best_offset = offset
+
+        top_inferred = first_detected - (best_offset * step)
+        clamp_margin = max(30, int(round(step * 2.0)))
+        top_inferred = int(np.clip(top_inferred, expected_top - clamp_margin, expected_top + clamp_margin))
+        return [top_inferred + (i * step) for i in range(target_rows)]
+
+    def _estimate_id_x_range_ratio_from_candidates(
+        candidates: List[np.ndarray],
+        image_width: int,
+        default_range: Tuple[float, float],
+        min_boxes: int,
+        min_width_ratio: float,
+        max_width_ratio: float,
+    ) -> Tuple[float, float]:
+        # Ước lượng miền X theo candidate thật để giảm lệch grid fixed ở các scan khó.
+        if image_width <= 0 or not candidates or len(candidates) < min_boxes:
+            return default_range
+
+        rects = [cv2.boundingRect(box) for box in candidates]
+        xs = np.array([r[0] for r in rects], dtype=np.float64)
+        xe = np.array([r[0] + r[2] for r in rects], dtype=np.float64)
+        ws = np.array([r[2] for r in rects], dtype=np.float64)
+        if xs.size == 0 or xe.size == 0 or ws.size == 0:
+            return default_range
+
+        margin = 0.5 * float(np.median(ws))
+        x0 = float(np.percentile(xs, 10.0)) - margin
+        x1 = float(np.percentile(xe, 90.0)) + margin
+
+        x0 = float(np.clip(x0, 0.0, float(image_width - 2)))
+        x1 = float(np.clip(x1, x0 + 1.0, float(image_width - 1)))
+
+        r0 = x0 / float(image_width)
+        r1 = x1 / float(image_width)
+        width_ratio = r1 - r0
+        if width_ratio < min_width_ratio or width_ratio > max_width_ratio:
+            return default_range
+        return (float(r0), float(r1))
+
+    sbd_x_range_ratio = _estimate_id_x_range_ratio_from_candidates(
+        active_sbd_candidates,
+        img.shape[1],
+        id_sbd_x_range_ratio_fixed,
+        min_boxes=18,
+        min_width_ratio=0.08,
+        max_width_ratio=0.22,
+    )
+    made_x_range_ratio = _estimate_id_x_range_ratio_from_candidates(
+        active_ma_de_candidates,
+        img.shape[1],
+        id_made_x_range_ratio_fixed,
+        min_boxes=9,
+        min_width_ratio=0.04,
+        max_width_ratio=0.14,
+    )
+
+    # Debug topview cho ID chỉ chạy khi bật cờ vì khá tốn thời gian.
+    if topview_debug and topview_allowed_by_rows and (
         sobao_danh["row_count"] <= id_fallback_row_threshold
         or ma_de["row_count"] <= id_fallback_row_threshold
     ):
@@ -4406,51 +5288,135 @@ def _demo(image_arg: Optional[str] = None) -> None:
             print("Topview debug skipped: affine transform unavailable (missing reliable corners)")
 
     fallback_threshold = max(0, int(id_fallback_row_threshold))
-    # Nếu detect quá ít hàng ID, dựng lưới tổng hợp 10 hàng theo vị trí cố định trên ảnh.
-    if sobao_danh["row_count"] <= fallback_threshold:
-        sobao_rows = _build_synthetic_id_rows_fixed_image_position(
-            image_shape=img.shape[:2],
-            cols=6,
-            rows=10,
-            x_range_ratio=sbd_x_range_ratio,
-            top_y_ratio=id_grid_top_ratio,
-            row_step_ratio=id_grid_row_step_ratio,
+    allow_ratio_id_fallback = topview_applied
+
+    sbd_needs_fallback = (
+        sobao_danh["row_count"] <= fallback_threshold
+        or int(current_id_quality.get("sbd_filled", 0)) == 0
+    )
+    ma_de_needs_fallback = (
+        ma_de["row_count"] <= fallback_threshold
+        or int(current_id_quality.get("ma_de_filled", 0)) == 0
+    )
+
+    if not allow_ratio_id_fallback and (
+        sbd_needs_fallback
+        or ma_de_needs_fallback
+    ):
+        print(
+            "[Fallback] Skipped synthetic ID ratio-grid: topview not applied "
+            f"(sbd_filled={current_id_quality.get('sbd_filled', 0)}, "
+            f"ma_de_filled={current_id_quality.get('ma_de_filled', 0)})"
         )
+    # Nếu detect quá ít hàng ID, dựng lưới tổng hợp 10 hàng theo vị trí cố định trên ảnh.
+    if allow_ratio_id_fallback and sbd_needs_fallback:
+        sbd_fallback_reason = (
+            f"rows <= {fallback_threshold}"
+            if sobao_danh["row_count"] <= fallback_threshold
+            else "filled cols = 0"
+        )
+        reference_positions = []
+        if (
+            ma_de["row_count"] >= 3
+            and ma_de["ma_de_rows"]
+            and int(current_id_quality.get("ma_de_filled", 0)) > 0
+        ):
+            reference_positions = _estimate_reference_positions_from_rows(ma_de["ma_de_rows"], target_rows=10)
+
+        if reference_positions:
+            ma_de_rects = [cv2.boundingRect(box) for row in ma_de["ma_de_rows"] for box in row]
+            ma_de_row_h = None
+            if ma_de_rects:
+                ma_de_row_h = int(round(float(np.median([r[3] for r in ma_de_rects]))))
+            sobao_rows = _build_synthetic_id_rows_from_reference_positions(
+                image_shape=img.shape[:2],
+                cols=6,
+                x_range_ratio=sbd_x_range_ratio,
+                reference_positions=reference_positions,
+                row_height=ma_de_row_h,
+            )
+            fallback_mode = "from-ma_de"
+        else:
+            sobao_rows = _build_synthetic_id_rows_fixed_image_position(
+                image_shape=img.shape[:2],
+                cols=6,
+                rows=10,
+                x_range_ratio=sbd_x_range_ratio,
+                top_y_ratio=id_grid_top_ratio,
+                row_step_ratio=id_grid_row_step_ratio,
+            )
+            fallback_mode = "fixed"
+
         if sobao_rows:
             sobao_danh["sobao_danh_rows"] = sobao_rows
             sobao_danh["sobao_danh"] = [b for row in sobao_rows for b in row]
             sobao_danh["row_count"] = len(sobao_rows)
+            sobao_rows_are_synthetic = True
             print(
-                f"[Fallback] SoBaoDanh rows <= {fallback_threshold}, "
-                "drew synthetic 6x10 grid (mode=fixed)"
+                f"[Fallback] SoBaoDanh {sbd_fallback_reason}, "
+                f"drew synthetic 6x10 grid (mode={fallback_mode})"
             )
 
-    if ma_de["row_count"] <= fallback_threshold:
-        ma_de_rows = _build_synthetic_id_rows_fixed_image_position(
-            image_shape=img.shape[:2],
-            cols=3,
-            rows=10,
-            x_range_ratio=made_x_range_ratio,
-            top_y_ratio=id_grid_top_ratio,
-            row_step_ratio=id_grid_row_step_ratio,
+    if allow_ratio_id_fallback and ma_de_needs_fallback:
+        ma_de_fallback_reason = (
+            f"rows <= {fallback_threshold}"
+            if ma_de["row_count"] <= fallback_threshold
+            else "filled cols = 0"
         )
+        reference_positions = []
+        if (
+            sobao_danh["row_count"] >= 3
+            and sobao_danh["sobao_danh_rows"]
+            and not sobao_rows_are_synthetic
+            and int(current_id_quality.get("sbd_filled", 0)) > 0
+        ):
+            reference_positions = _estimate_reference_positions_from_rows(sobao_danh["sobao_danh_rows"], target_rows=10)
+
+        if reference_positions:
+            sbd_rects = [cv2.boundingRect(box) for row in sobao_danh["sobao_danh_rows"] for box in row]
+            sbd_row_h = None
+            if sbd_rects:
+                sbd_row_h = int(round(float(np.median([r[3] for r in sbd_rects]))))
+            ma_de_rows = _build_synthetic_id_rows_from_reference_positions(
+                image_shape=img.shape[:2],
+                cols=3,
+                x_range_ratio=made_x_range_ratio,
+                reference_positions=reference_positions,
+                row_height=sbd_row_h,
+            )
+            fallback_mode = "from-sobao"
+        else:
+            ma_de_rows = _build_synthetic_id_rows_fixed_image_position(
+                image_shape=img.shape[:2],
+                cols=3,
+                rows=10,
+                x_range_ratio=made_x_range_ratio,
+                top_y_ratio=id_grid_top_ratio,
+                row_step_ratio=id_grid_row_step_ratio,
+            )
+            fallback_mode = "fixed"
+
         if ma_de_rows:
             ma_de["ma_de_rows"] = ma_de_rows
             ma_de["ma_de"] = [b for row in ma_de_rows for b in row]
             ma_de["row_count"] = len(ma_de_rows)
+            ma_de_rows_are_synthetic = True
             print(
-                f"[Fallback] MaDe rows <= {fallback_threshold}, "
-                "drew synthetic 3x10 grid (mode=fixed)"
+                f"[Fallback] MaDe {ma_de_fallback_reason}, "
+                f"drew synthetic 3x10 grid (mode={fallback_mode})"
             )
 
     # Bù thiếu MaDe lên đủ 10 hàng bằng cách neo theo trục Y của SoBaoDanh.
     # Ý tưởng: dùng hình học cột MaDe đã phát hiện tốt để nội suy những hàng bị mất.
-    if ma_de["row_count"] < 10 and ma_de["ma_de_rows"] and sobao_danh["sobao_danh_rows"]:
-        ref_positions = [
-            int(round(float(np.mean([cv2.boundingRect(box)[1] for box in row]))))
-            for row in sobao_danh["sobao_danh_rows"][:10]
-            if row
-        ]
+    if ma_de["row_count"] < 10 and ma_de["ma_de_rows"]:
+        if sobao_danh["sobao_danh_rows"] and not sobao_rows_are_synthetic:
+            ref_positions = [
+                int(round(float(np.mean([cv2.boundingRect(box)[1] for box in row]))))
+                for row in sobao_danh["sobao_danh_rows"][:10]
+                if row
+            ]
+        else:
+            ref_positions = _estimate_reference_positions_from_rows(ma_de["ma_de_rows"], target_rows=10)
 
         ma_de_rect_rows = []
         for row in ma_de["ma_de_rows"]:
@@ -4507,6 +5473,127 @@ def _demo(image_arg: Optional[str] = None) -> None:
                 ma_de["ma_de_rows"] = ma_de_completed_rows
                 ma_de["ma_de"] = [box for row in ma_de_completed_rows for box in row]
                 ma_de["row_count"] = 10
+                if len(ma_de_rect_rows) < 10:
+                    ma_de_rows_are_synthetic = True
+
+    # Bù thiếu SoBaoDanh lên đủ 10 hàng bằng cách neo theo trục Y của Mã đề.
+    # Hữu ích cho các mẫu có SBD mất nhiều hàng nhưng Mã đề vẫn đủ 10 hàng (ví dụ 0018).
+    if (
+        sobao_danh["row_count"] < 10
+        and sobao_danh["sobao_danh_rows"]
+        and ma_de["ma_de_rows"]
+        and not ma_de_rows_are_synthetic
+    ):
+        ref_positions = [
+            int(round(float(np.mean([cv2.boundingRect(box)[1] for box in row]))))
+            for row in ma_de["ma_de_rows"][:10]
+            if row
+        ]
+
+        sobao_rect_rows = []
+        for row in sobao_danh["sobao_danh_rows"]:
+            rects = [cv2.boundingRect(box) for box in row]
+            rects = sorted(rects, key=lambda r: r[0])
+            if len(rects) == 6:
+                sobao_rect_rows.append(rects)
+
+        if len(ref_positions) == 10 and sobao_rect_rows:
+            # Dựng template hình học ổn định cho 6 cột SoBaoDanh.
+            col_x = [int(round(float(np.median([rects[c][0] for rects in sobao_rect_rows])))) for c in range(6)]
+            col_w = [int(round(float(np.median([rects[c][2] for rects in sobao_rect_rows])))) for c in range(6)]
+            row_h = int(round(float(np.median([rects[0][3] for rects in sobao_rect_rows]))))
+            row_h = max(1, row_h)
+
+            detected_rows_y = [int(round(float(np.mean([r[1] for r in rects])))) for rects in sobao_rect_rows]
+            align_tolerance = max(35, int(round(row_h * 1.2)))
+            aligned_rows: List[Optional[List[np.ndarray]]] = [None] * 10
+            matched_rows: List[Tuple[int, List[Tuple[int, int, int, int]], int]] = []
+
+            used_ref_indices = set()
+            for rects, row_y in sorted(zip(sobao_rect_rows, detected_rows_y), key=lambda t: t[1]):
+                candidates = sorted(
+                    range(10),
+                    key=lambda idx: abs(ref_positions[idx] - row_y),
+                )
+                chosen_idx = None
+                for idx in candidates:
+                    if idx in used_ref_indices:
+                        continue
+                    if abs(ref_positions[idx] - row_y) <= align_tolerance:
+                        chosen_idx = idx
+                        break
+                if chosen_idx is None:
+                    continue
+
+                row_polys = [_rect_to_poly(rx, ry, rw, rh) for rx, ry, rw, rh in rects]
+                aligned_rows[chosen_idx] = row_polys
+                used_ref_indices.add(chosen_idx)
+                matched_rows.append((chosen_idx, rects, row_y))
+
+            # Ước lượng xu hướng x theo y cho từng cột để giảm lệch phối cảnh ở hàng nội suy.
+            col_x_trend_samples: List[List[Tuple[float, float]]] = [[] for _ in range(6)]
+            for rects, row_y in zip(sobao_rect_rows, detected_rows_y):
+                for c in range(6):
+                    col_x_trend_samples[c].append((float(row_y), float(rects[c][0])))
+
+            def _predict_col_x(col_idx: int, y_target: float) -> int:
+                samples = col_x_trend_samples[col_idx]
+                base_x = col_x[col_idx]
+                if len(samples) < 2:
+                    return int(base_x)
+
+                ys = np.array([p[0] for p in samples], dtype=np.float64)
+                xs = np.array([p[1] for p in samples], dtype=np.float64)
+                if float(np.max(ys) - np.min(ys)) < 1.0:
+                    return int(base_x)
+
+                slope, intercept = np.polyfit(ys, xs, 1)
+                pred = float(slope * float(y_target) + intercept)
+
+                # Chặn miền dự đoán để tránh x trôi quá xa khi ngoại suy hàng trên cùng.
+                margin = max(8.0, float(col_w[col_idx]) * 2.0)
+                x_min = float(np.min(xs)) - margin
+                x_max = float(np.max(xs)) + margin
+                pred = float(np.clip(pred, x_min, x_max))
+                return int(round(pred))
+
+            # Ước lượng lệch Y giữa 2 cụm SBD/Mã đề từ các hàng đã match.
+            y_bias = 0
+            if matched_rows:
+                y_deltas = [int(row_y - ref_positions[idx]) for idx, _, row_y in matched_rows]
+                y_bias = int(round(float(np.median(y_deltas))))
+
+            # Bù lệch X theo từng cột để giảm drift khi ngoại suy sang vùng thiếu hàng.
+            col_x_bias = [0] * 6
+            if matched_rows:
+                for c in range(6):
+                    x_deltas: List[int] = []
+                    for idx, rects, _ in matched_rows:
+                        y_anchor = float(ref_positions[idx] + y_bias)
+                        pred_x = _predict_col_x(c, y_anchor)
+                        x_deltas.append(int(rects[c][0] - pred_x))
+                    if x_deltas:
+                        col_x_bias[c] = int(round(float(np.median(x_deltas))))
+
+            # Nội suy các hàng còn thiếu bằng box tổng hợp tại các mốc Y tham chiếu.
+            for idx in range(10):
+                if aligned_rows[idx] is not None:
+                    continue
+                y_ref = ref_positions[idx] + y_bias
+                synthetic_row: List[np.ndarray] = []
+                for c in range(6):
+                    x = _predict_col_x(c, float(y_ref)) + col_x_bias[c]
+                    w = max(1, col_w[c])
+                    synthetic_row.append(_rect_to_poly(x, y_ref, w, row_h))
+                aligned_rows[idx] = synthetic_row
+
+            sobao_completed_rows = [row for row in aligned_rows if row is not None]
+            if len(sobao_completed_rows) == 10:
+                sobao_danh["sobao_danh_rows"] = sobao_completed_rows
+                sobao_danh["sobao_danh"] = [box for row in sobao_completed_rows for box in row]
+                sobao_danh["row_count"] = 10
+                if len(sobao_rect_rows) < 10:
+                    sobao_rows_are_synthetic = True
 
     print(f"MaDe rows: {ma_de['row_count']}")
     print(f"MaDe boxes: {len(ma_de['ma_de'])}")
@@ -4515,11 +5602,21 @@ def _demo(image_arg: Optional[str] = None) -> None:
     print(f"MaDe rows (final): {ma_de['row_count']}")
     
     # Căn thẳng theo trục Y và ngoại suy để cả SBD/Mã đề đều đủ 10 hàng logic.
+    expected_id_top_y = int(round(float(id_grid_top_ratio) * float(img.shape[0])))
+    expected_id_row_step = max(6, int(round(float(id_grid_row_step_ratio) * float(img.shape[0]))))
     combined_results = {
         "sobao_danh_rows": sobao_danh["sobao_danh_rows"],
-        "ma_de_rows": ma_de["ma_de_rows"]
+        "ma_de_rows": ma_de["ma_de_rows"],
+        "sobao_is_synthetic": sobao_rows_are_synthetic,
+        "ma_de_is_synthetic": ma_de_rows_are_synthetic,
     }
-    extrapolated = extrapolate_missing_rows(combined_results, target_rows=10, debug=False)
+    extrapolated = extrapolate_missing_rows(
+        combined_results,
+        target_rows=10,
+        expected_top_y=expected_id_top_y,
+        expected_row_step=expected_id_row_step,
+        debug=False,
+    )
     
     print(f"\nExtrapolation Summary:")
     print(f"  SoBaoDanh: {extrapolated['sobao_detected_count']}/10 detected, {extrapolated['sobao_missing_count']} missing")
@@ -4541,15 +5638,19 @@ def _demo(image_arg: Optional[str] = None) -> None:
     sobao_rows_aligned = extrapolated.get("sobao_danh_rows_aligned", sobao_danh["sobao_danh_rows"])
     ma_de_rows_aligned = extrapolated.get("ma_de_rows_aligned", ma_de["ma_de_rows"])
 
-    sbd_digits = evaluate_digit_rows_mean_darkness(
+    binary_for_digits = data.get("binary")
+
+    sbd_digits = evaluate_digit_rows_with_binary_fallback(
         gray_for_digits,
         sobao_rows_aligned,
         expected_cols=6,
+        binary_image=binary_for_digits,
     )
-    made_digits = evaluate_digit_rows_mean_darkness(
+    made_digits = evaluate_digit_rows_with_binary_fallback(
         gray_for_digits,
         ma_de_rows_aligned,
         expected_cols=3,
+        binary_image=binary_for_digits,
     )
 
     print("\n=== Mean-Darkness Digit Decode ===")
@@ -4592,22 +5693,22 @@ def _demo(image_arg: Optional[str] = None) -> None:
     print(f"\n=== Drawing grids on all parts ===")
     combined_grid_image = img.copy()
     
-    binary_threshold = data.get("binary")
+    binary_threshold = data.get("binary_score", data.get("binary"))
     if binary_threshold is not None:
         print("\nUsing binary threshold image for fill-ratio classification")
 
     # Phần I: lưới 4x10 chuẩn, ưu tiên giữ sát khung thật để giảm lệch ô.
     part_i_evals: List[Dict[str, object]] = []
     if parts["part_i"]:
-        print(f"\n=== Part I: 4x10 grid (20% x, 10% y) ===")
+        print(f"\n=== Part I: 4x10 grid (18.5% left, 3.0% right, 10% y) ===")
         grid_result = extract_grid_from_boxes(
             combined_grid_image,
             boxes=parts["part_i"],
             grid_cols=4,
             grid_rows=10,
-            start_offset_ratio_x=0.2,
+            start_offset_ratio_x=0.185,
             start_offset_ratio_y=0.1,
-            end_offset_ratio_x=0.015,
+            end_offset_ratio_x=0.03,
             end_offset_ratio_y=0.015,
             grid_color=(0, 255, 0),  # Màu xanh lá
             grid_thickness=1,
@@ -4619,11 +5720,32 @@ def _demo(image_arg: Optional[str] = None) -> None:
             section_name="Part I",
             binary_threshold=binary_threshold,
             grid_info=grid_result["grid_info"],
-            fill_ratio_thresh=0.54,
-            inner_margin_ratio=0.05,
+            fill_ratio_thresh=0.55,
+            inner_margin_ratio=0.01,
             circle_radius_scale=0.6,
-            circle_border_exclude_ratio=0.1,
+            circle_border_exclude_ratio=0.12,
         )
+
+        if part_i_evals:
+            part_i_evals_refined = suppress_false_positive_by_relative_dominance(
+                part_i_evals,
+                group_keys=("box_idx", "row"),
+                ratio_key="fill_ratio",
+                min_dominant_ratio=0.52,
+                min_gap=0.12,
+                min_ratio_scale=1.35,
+            )
+            suppressed_count = sum(
+                1
+                for item in part_i_evals_refined
+                if bool(item.get("suppressed_by_dominance", False))
+            )
+            if suppressed_count > 0:
+                print(
+                    f"[Part I] Dominance filter suppressed {suppressed_count} false-positive cells"
+                )
+                _print_fill_summary("Part I (after dominance)", part_i_evals_refined)
+            part_i_evals = part_i_evals_refined
     
     # Phần II: mỗi cụm có offset xen kẽ trái/phải để bám đúng bố cục phiếu.
     part_ii_evals: List[Dict[str, object]] = []
@@ -4661,11 +5783,33 @@ def _demo(image_arg: Optional[str] = None) -> None:
             section_name="Part II",
             binary_threshold=binary_threshold,
             grid_info=grid_result_ii["grid_info"],
-            fill_ratio_thresh=0.54,
+            fill_ratio_thresh=0.52,
             inner_margin_ratio=0.01,
             circle_radius_scale=0.6,
-            circle_border_exclude_ratio=0.1,
+            # Part II dễ bị false-positive do viền bubble đậm; loại bớt viền để ưu tiên vùng lõi tô.
+            circle_border_exclude_ratio=0.18,
         )
+
+        if part_ii_evals:
+            part_ii_evals_refined = suppress_false_positive_by_relative_dominance(
+                part_ii_evals,
+                group_keys=("box_idx", "row"),
+                ratio_key="fill_ratio",
+                min_dominant_ratio=0.52,
+                min_gap=0.10,
+                min_ratio_scale=1.25,
+            )
+            suppressed_count = sum(
+                1
+                for item in part_ii_evals_refined
+                if bool(item.get("suppressed_by_dominance", False))
+            )
+            if suppressed_count > 0:
+                print(
+                    f"[Part II] Dominance filter suppressed {suppressed_count} false-positive cells"
+                )
+                _print_fill_summary("Part II (after dominance)", part_ii_evals_refined)
+            part_ii_evals = part_ii_evals_refined
     
     # Phần III: lưới 4x12 với pattern hàng đầu đặc biệt theo mẫu đề.
     part_iii_evals: List[Dict[str, object]] = []
@@ -4697,11 +5841,32 @@ def _demo(image_arg: Optional[str] = None) -> None:
             section_name="Part III",
             binary_threshold=binary_threshold,
             grid_info=grid_result_iii["grid_info"],
-            fill_ratio_thresh=0.54,
+            fill_ratio_thresh=0.52,
             inner_margin_ratio=0.05,
             circle_radius_scale=0.6,
-            circle_border_exclude_ratio=0.1,
+            circle_border_exclude_ratio=0.12,
         )
+
+        if part_iii_evals:
+            part_iii_evals_refined = suppress_false_positive_by_relative_dominance(
+                part_iii_evals,
+                group_keys=("box_idx", "col"),
+                ratio_key="fill_ratio",
+                min_dominant_ratio=0.52,
+                min_gap=0.10,
+                min_ratio_scale=1.20,
+            )
+            suppressed_count = sum(
+                1
+                for item in part_iii_evals_refined
+                if bool(item.get("suppressed_by_dominance", False))
+            )
+            if suppressed_count > 0:
+                print(
+                    f"[Part III] Dominance filter suppressed {suppressed_count} false-positive cells"
+                )
+                _print_fill_summary("Part III (after dominance)", part_iii_evals_refined)
+            part_iii_evals = part_iii_evals_refined
 
     # Vẽ lưới contour của SBD/Mã đề trên ảnh tổng hợp để đối chiếu toàn cục.
     sobao_grid_color = (255, 128, 0)  # Cam
@@ -4773,5 +5938,10 @@ if __name__ == "__main__":
         default=None,
         help="Định danh ảnh (chấp nhận cùng định dạng như tham số vị trí image).",
     )
+    parser.add_argument(
+        "--topview-debug",
+        action="store_true",
+        help="Bật nhánh debug topview cho ID (tăng thời gian xử lý).",
+    )
     args = parser.parse_args()
-    _demo(image_arg=args.image_opt or args.image)
+    _demo(image_arg=args.image_opt or args.image, topview_debug=bool(args.topview_debug))
